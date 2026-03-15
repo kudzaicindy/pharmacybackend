@@ -1,3 +1,7 @@
+# Build tooling first (avoids "Cannot import setuptools.build_meta" on Render)
+setuptools>=65.0.0
+wheel>=0.38.0
+
 Django>=6.0.0
 djangorestframework==3.14.0
 django-cors-headers==4.3.1
@@ -9,5 +13,7 @@ Pillow>=12.0.0
 google-generativeai==0.3.2
 requests==2.31.0
 pytesseract==0.3.10
-opencv-python==4.8.1.78
-numpy==1.24.3
+# Pin numpy first so pip uses wheel (1.26.4); old numpy builds fail on Python 3.12 (pkgutil.ImpImporter removed)
+numpy==1.26.4
+# 4.10+ has wheels for Python 3.12 and works with numpy 1.26; older 4.8.x can pull numpy 1.24 and trigger source build
+opencv-python>=4.10.0
