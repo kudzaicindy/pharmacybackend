@@ -1,0 +1,13 @@
+Django>=6.0.0
+djangorestframework==3.14.0
+django-cors-headers==4.3.1
+python-dotenv==1.0.0
+pymongo==4.6.0
+mongoengine==0.27.0
+django-environ==0.11.2
+Pillow>=12.0.0
+google-generativeai==0.3.2
+requests==2.31.0
+pytesseract==0.3.10
+opencv-python==4.8.1.78
+numpy==1.24.3
