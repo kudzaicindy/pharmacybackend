@@ -1,5 +1,21 @@
 # Deploying on Render
 
+This is a **Django** app. Use **gunicorn**, not uvicorn.
+
+## Start Command (required)
+
+In Render → your service → **Settings** → **Build & Deploy** → **Start Command**, set:
+
+```bash
+gunicorn pharmacybackend.wsgi:application --bind 0.0.0.0:$PORT
+```
+
+If you see `uvicorn: command not found`, the start command was set for FastAPI; change it to the line above.
+
+---
+
+## Build failures: setuptools / numpy
+
 If the default build fails with **"Cannot import 'setuptools.build_meta'"**, do one of the following.
 
 ## Option 1: Use the build script (recommended)
