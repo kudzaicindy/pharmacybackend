@@ -1,0 +1,6 @@
+Copy this EXACT line into Render → Your Service → Settings → Build & Deploy → Start Command
+(Replace the current "uvicorn main:app" with this.)
+
+gunicorn pharmacybackend.wsgi:application --bind 0.0.0.0:$PORT
+
+Then click Save and redeploy.

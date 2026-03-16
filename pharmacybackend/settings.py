@@ -6,11 +6,20 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
-
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load .env from project root (so it works regardless of current working directory)
+_env_file = BASE_DIR / '.env'
+_env_example = BASE_DIR / '.env.example'
+if _env_file.exists():
+    load_dotenv(_env_file)
+elif _env_example.exists():
+    load_dotenv(_env_example)
+    if os.getenv('DEBUG', '').lower() == 'true':
+        print("[INFO] Loaded .env.example (no .env found). Copy .env.example to .env and add your API keys.")
+else:
+    load_dotenv()  # fallback: current directory
 
 
 # Quick-start development settings - unsuitable for production

@@ -39,9 +39,9 @@ def get_chatbot_service():
             # API key missing or invalid
             error_msg = str(e)
             print(f"[ERROR] Chatbot service initialization failed: {error_msg}")
-            if "OPENROUTER_API_KEY" in error_msg:
-                print("[INFO] Please add OPENROUTER_API_KEY to your .env file")
-                print("[INFO] Get your API key from: https://openrouter.ai/keys")
+            if "OPENROUTER_API_KEY" in error_msg or "GEMINI_API_KEY" in error_msg:
+                print("[INFO] Add OPENROUTER_API_KEY or GEMINI_API_KEY to your .env file")
+                print("[INFO] OpenRouter: https://openrouter.ai/keys | Gemini: https://aistudio.google.com/apikey")
             return None
         except ImportError as e:
             # google.generativeai not installed
@@ -113,8 +113,8 @@ def chat(request):
     if not chatbot_service:
         error_msg = (
             'Chatbot service is currently unavailable. '
-            'Please check your OPENROUTER_API_KEY configuration in the .env file. '
-            'Get your API key from: https://openrouter.ai/keys'
+            'Add OPENROUTER_API_KEY or GEMINI_API_KEY to your .env file. '
+            'OpenRouter: https://openrouter.ai/keys | Gemini: https://aistudio.google.com/apikey'
         )
         print(f"[ERROR] {error_msg}")
         return Response({

@@ -203,16 +203,23 @@ Medicine names:"""
 
 
 class ChatbotService:
-    """Service for handling AI chatbot interactions using OpenRouter API"""
+    """Service for handling AI chatbot interactions using OpenRouter API or Gemini (fallback)"""
     
     def __init__(self):
         self.api_key = os.getenv('OPENROUTER_API_KEY')
-        if not self.api_key:
-            raise ValueError("OPENROUTER_API_KEY not found in environment variables")
-        
+        self.gemini_key = os.getenv('GEMINI_API_KEY')
+        self.backend = None
+        if self.api_key:
+            self.backend = 'openrouter'
+        elif self.gemini_key:
+            self.backend = 'gemini'
+            print("[INFO] Chatbot using GEMINI_API_KEY (OpenRouter not set)")
+        if not self.backend:
+            raise ValueError(
+                "Neither OPENROUTER_API_KEY nor GEMINI_API_KEY found. "
+                "Add one to your .env: OPENROUTER_API_KEY from https://openrouter.ai/keys or GEMINI_API_KEY from Google AI."
+            )
         self.api_url = "https://openrouter.ai/api/v1/chat/completions"
-        # Using google/gemini-2.5-flash-lite for free tier (most generous free allowance)
-        # Alternative free models: meta-llama/llama-3.2-3b-instruct:free, mistralai/mistral-7b-instruct:free
         self.model = "google/gemini-2.5-flash-lite"
         
         # System prompt for healthcare chatbot
@@ -252,6 +259,30 @@ Important guidelines:
 - Always include disclaimers about consulting healthcare professionals
 - Support English, Shona, and Ndebele languages when possible
 - Mention medicine names clearly so they can be extracted (paracetamol, ibuprofen, etc.)"""
+    
+    def _call_gemini(self, system_content: str, history: List[Dict[str, str]], user_message: str) -> str:
+        """Generate chat response using Google Gemini (fallback when OpenRouter not set)."""
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.gemini_key)
+            model = genai.GenerativeModel('gemini-2.0-flash-lite')
+            parts = [system_content]
+            for msg in history:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "user":
+                    parts.append(f"User: {content}")
+                else:
+                    parts.append(f"Assistant: {content}")
+            parts.append(f"User: {user_message}")
+            prompt = "\n\n".join(parts)
+            response = model.generate_content(prompt)
+            if response and response.text:
+                return response.text.strip()
+            return "I couldn't generate a response. Please try again."
+        except Exception as e:
+            print(f"[ERROR] Gemini chat fallback failed: {e}")
+            raise
     
     def process_message(
         self,
@@ -323,26 +354,30 @@ Important guidelines:
                     "content": user_message
                 })
                 
-                # Make API request to OpenRouter
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://pharmacybackend.com",  # Optional: for analytics
-                    "X-Title": "Pharmacy Chatbot"  # Optional: for analytics
-                }
-                
-                payload = {
-                    "model": self.model,
-                    "messages": openrouter_messages,
-                    "temperature": 0.7,
-                    "max_tokens": 500
-                }
-                
-                response = requests.post(self.api_url, headers=headers, json=payload, timeout=30)
-                response.raise_for_status()
-                
-                result = response.json()
-                ai_response = result['choices'][0]['message']['content'].strip()
+                if self.backend == 'gemini':
+                    ai_response = self._call_gemini(
+                        system_content=self.system_prompt + language_instruction,
+                        history=conversation_history[-8:],
+                        user_message=user_message
+                    )
+                else:
+                    # Make API request to OpenRouter
+                    headers = {
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://pharmacybackend.com",
+                        "X-Title": "Pharmacy Chatbot"
+                    }
+                    payload = {
+                        "model": self.model,
+                        "messages": openrouter_messages,
+                        "temperature": 0.7,
+                        "max_tokens": 500
+                    }
+                    response = requests.post(self.api_url, headers=headers, json=payload, timeout=30)
+                    response.raise_for_status()
+                    result = response.json()
+                    ai_response = result['choices'][0]['message']['content'].strip()
                 
             except requests.exceptions.RequestException as api_error:
                 error_msg = str(api_error)
