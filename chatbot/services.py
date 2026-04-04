@@ -206,14 +206,19 @@ class ChatbotService:
     """Service for handling AI chatbot interactions using OpenRouter API or Gemini (fallback)"""
     
     def __init__(self):
-        self.api_key = os.getenv('OPENROUTER_API_KEY')
-        self.gemini_key = os.getenv('GEMINI_API_KEY')
+        self.api_key = (os.getenv('OPENROUTER_API_KEY') or '').strip()
+        self.gemini_key = (os.getenv('GEMINI_API_KEY') or '').strip()
+        use_gemini = os.getenv('USE_GEMINI_FOR_CHAT', '').lower() in ('1', 'true', 'yes')
         self.backend = None
-        if self.api_key:
-            self.backend = 'openrouter'
-        elif self.gemini_key:
+        # Prefer Gemini when USE_GEMINI_FOR_CHAT is set or when only GEMINI_API_KEY is set
+        if use_gemini and self.gemini_key:
+            self.backend = 'gemini'
+            print("[INFO] Chatbot using GEMINI_API_KEY (USE_GEMINI_FOR_CHAT=true)")
+        elif self.gemini_key and not self.api_key:
             self.backend = 'gemini'
             print("[INFO] Chatbot using GEMINI_API_KEY (OpenRouter not set)")
+        elif self.api_key:
+            self.backend = 'openrouter'
         if not self.backend:
             raise ValueError(
                 "Neither OPENROUTER_API_KEY nor GEMINI_API_KEY found. "
@@ -231,14 +236,12 @@ Your role is to:
 4. Always remind users to consult healthcare professionals for medical advice
 
 SYMPTOM DESCRIPTION FLOW (CRITICAL - follow EXACTLY, in this order):
-Step 1 - When patient describes symptoms (e.g., "I have fever", "I have a headache", "headache and body pains"):
-  • NEVER ask for location in this step. NEVER say "where are you" or "what is your location".
-  • Analyze symptoms and suggest specific medicines with rationale, e.g.:
-    "Based on your symptoms, you might need:
-    • Paracetamol – for fever and headache
-    • Ibuprofen – for pain relief
-    Would you like to search for these medicines? You can say yes or tell me which ones you want."
-  • End with the question "Would you like to search for these medicines?" - do NOT ask for location.
+Step 1 - When patient describes ANY symptoms (e.g. "I have fever", "I have a headache", "I have sore legs", "sore leg", "leg pain", "runny stomach", "body pains", "muscle ache"):
+  • NEVER ask for location in Step 1. NEVER say "where are you", "share your location", or "I need your location" in this step.
+  • First: analyze the symptoms and suggest 2–4 specific medicine names with a short reason for each.
+  • Use exact medicine names so they can be detected: paracetamol, ibuprofen, diclofenac, loperamide, oral rehydration salts, antacid, cough syrup, etc.
+  • Example: "Based on your symptoms (sore legs / leg pain), you might need: • Paracetamol – for pain • Ibuprofen – for pain and inflammation • Diclofenac – for muscle/leg pain. Would you like to search for these medicines? You can say yes or tell me which ones you want."
+  • End Step 1 with: "Would you like to search for these medicines?" Do NOT ask for location yet.
 
 Step 2 - ONLY after patient confirms (e.g., "Yes", "I want paracetamol", "All of them"):
   • Acknowledge their selection
@@ -258,14 +261,17 @@ Important guidelines:
 - Never provide medical diagnosis
 - Always include disclaimers about consulting healthcare professionals
 - Support English, Shona, and Ndebele languages when possible
-- Mention medicine names clearly so they can be extracted (paracetamol, ibuprofen, etc.)"""
+- Mention medicine names clearly so they can be extracted (paracetamol, ibuprofen, etc.)
+- Paracetamol is appropriate for sore throat (pain and fever relief); also suggest throat lozenges and, if relevant, cough syrup or amoxicillin. For sore throat give 2–4 options including paracetamol and at least one throat-specific option (e.g. throat lozenges)."""
     
     def _call_gemini(self, system_content: str, history: List[Dict[str, str]], user_message: str) -> str:
         """Generate chat response using Google Gemini (fallback when OpenRouter not set)."""
         try:
             import google.generativeai as genai
             genai.configure(api_key=self.gemini_key)
-            model = genai.GenerativeModel('gemini-2.0-flash-lite')
+            # Use model with free-tier quota; override with GEMINI_CHAT_MODEL in .env if needed
+            chat_model = os.getenv('GEMINI_CHAT_MODEL', 'gemini-1.5-flash')
+            model = genai.GenerativeModel(chat_model)
             parts = [system_content]
             for msg in history:
                 role = msg.get("role", "user")
@@ -402,7 +408,7 @@ Important guidelines:
             entities = self._extract_entities(user_message)
             requires_location = self._check_location_requirement(user_message, ai_response)
             suggested_medicines = self._extract_medicine_suggestions(ai_response)
-            # For symptom intent, add symptom-based suggestions (per platform guide)
+            # For symptom intent, supplement suggested_medicines from our map if AI didn't list any (for frontend only; AI response text is never overridden)
             if intent == 'symptom_description':
                 symptom_suggestions = self._suggest_medicines_from_symptoms(user_message, entities)
                 for m in symptom_suggestions:
@@ -439,7 +445,48 @@ Important guidelines:
             import traceback
             print(f"[ERROR] Traceback:\n{traceback.format_exc()}")
             
-            # Check for specific API errors
+            # Rule-based fallback when API fails: keep the flow going.
+            # 1) User said "yes"/"ok" after we suggested medicines → ask for location
+            confirmation_words = ['yes', 'yeah', 'yep', 'ok', 'okay', 'sure', 'all of them', 'proceed', 'go ahead']
+            suggested_from_context = (context or {}).get('suggested_medicines') or []
+            if user_message.lower().strip() in confirmation_words and suggested_from_context:
+                print("[INFO] Rule-based fallback: user confirmed medicines; asking for location.")
+                return {
+                    'response': "To find pharmacies near you, please share your location (e.g. area name or use your current location).",
+                    'intent': 'medicine_selection',
+                    'entities': {},
+                    'requires_location': True,
+                    'suggested_medicines': suggested_from_context,
+                    'selected_medicines': suggested_from_context,
+                    'confidence': 0.7,
+                    'fallback': True,
+                }
+            # 2) User described symptoms → suggest medicines from built-in map
+            symptom_words = [
+                'headache', 'pain', 'pains', 'fever', 'stomach', 'runny stomach', 'sore leg', 'leg',
+                'cough', 'cold', 'flu', 'nausea', 'sore throat', 'runny nose', 'body ache', 'muscle'
+            ]
+            if any(w in user_message.lower() for w in symptom_words):
+                entities_fallback = self._extract_entities(user_message)
+                suggested = self._suggest_medicines_from_symptoms(user_message, entities_fallback)
+                if suggested:
+                    med_lines = '\n'.join(f"• {m.title()}" for m in suggested[:5])
+                    fallback_response = (
+                        f"Based on your symptoms, you might need:\n{med_lines}\n\n"
+                        "Would you like to search for these medicines? You can say yes or tell me which ones you want."
+                    )
+                    print("[INFO] Using rule-based fallback (API unavailable); suggested medicines from symptom map.")
+                    return {
+                        'response': fallback_response,
+                        'intent': 'symptom_description',
+                        'entities': entities_fallback,
+                        'requires_location': False,
+                        'suggested_medicines': suggested,
+                        'confidence': 0.7,
+                        'fallback': True,
+                    }
+            
+            # No fallback match: return user-friendly error
             if 'quota' in error_str.lower() or '429' in error_str or 'rate limit' in error_str.lower():
                 error_response = (
                     "I'm currently experiencing high demand. The API quota may have been reached. "
@@ -494,10 +541,16 @@ Important guidelines:
         if any(m in message_lower for m in ['paracetamol', 'panadol', 'ibuprofen', 'aspirin', 'antihistamine', 'antacid']):
             if any(s in message_lower for s in ['and', 'or', 'want', 'take', 'need', 'both']):
                 return 'medicine_selection'
-        if any(word in message_lower for word in ['headache', 'pain', 'fever', 'symptom', 'feeling', 'body pain', 'body ache', 'muscle']):
+        # Symptom description: user describes how they feel (must suggest medicines first, then ask for location)
+        symptom_words = [
+            'headache', 'pain', 'pains', 'fever', 'symptom', 'feeling', 'body pain', 'body ache', 'muscle',
+            'stomach', 'runny stomach', 'upset stomach', 'diarrhea', 'diarrhoea', 'vomiting', 'vomit',
+            'cough', 'cold', 'flu', 'nausea', 'dizziness', 'sore throat', 'runny nose', 'stuffy nose',
+            'sore leg', 'sore legs', 'leg pain', 'legs', 'leg '
+        ]
+        if any(word in message_lower for word in symptom_words):
             return 'symptom_description'
-        else:
-            return 'general_inquiry'
+        return 'general_inquiry'
     
     def _extract_entities(self, message: str) -> Dict:
         """Extract medical entities from message"""
@@ -516,8 +569,9 @@ Important guidelines:
         # Symptom patterns (include body pains, myalgia for "body pains")
         symptom_keywords = [
             'headache', 'fever', 'pain', 'pains', 'cough', 'cold', 'flu', 'nausea', 'dizziness',
-            'sore throat', 'stomach ache', 'stomach', 'diarrhea', 'diarrhoea', 'runny nose',
-            'stuffy nose', 'body ache', 'body pain', 'body pains', 'muscle ache', 'myalgia', 'upset stomach'
+            'sore throat', 'stomach ache', 'stomach', 'runny stomach', 'diarrhea', 'diarrhoea', 'runny nose',
+            'stuffy nose', 'body ache', 'body pain', 'body pains', 'muscle ache', 'myalgia', 'upset stomach',
+            'sore leg', 'sore legs', 'leg pain', 'legs', 'leg'
         ]
         
         message_lower = message.lower()
@@ -622,6 +676,11 @@ Important guidelines:
             'body pains': ['paracetamol', 'ibuprofen'],
             'muscle ache': ['paracetamol', 'ibuprofen', 'diclofenac'],
             'myalgia': ['paracetamol', 'ibuprofen'],
+            'sore leg': ['paracetamol', 'ibuprofen', 'diclofenac'],
+            'sore legs': ['paracetamol', 'ibuprofen', 'diclofenac'],
+            'leg pain': ['paracetamol', 'ibuprofen', 'diclofenac'],
+            'legs': ['paracetamol', 'ibuprofen', 'diclofenac'],
+            'leg': ['paracetamol', 'ibuprofen', 'diclofenac'],
         }
         message_lower = message.lower()
         suggested = []
@@ -887,6 +946,43 @@ class LocationService:
         except Exception as e:
             print(f"[ERROR] Geocoding error for '{address}': {str(e)}")
             return (None, None)
+    
+    @staticmethod
+    def reverse_geocode(lat: float, lon: float, fallback: str = "") -> str:
+        """
+        Convert coordinates to a human-readable suburb/area name using OpenStreetMap Nominatim.
+        Returns a short place string like "Marlborough, Harare" or fallback/empty string if lookup fails.
+        """
+        if lat is None or lon is None:
+            return fallback or ""
+        try:
+            url = "https://nominatim.openstreetmap.org/reverse"
+            headers = {
+                "User-Agent": "PharmacyBackend/1.0"  # Required by Nominatim
+            }
+            params = {
+                "lat": lat,
+                "lon": lon,
+                "format": "json",
+                "addressdetails": 1,
+            }
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                return fallback or ""
+            data = resp.json() or {}
+            addr = data.get("address") or {}
+            # Prefer suburb / neighbourhood, then city/town, then county/state
+            suburb = addr.get("suburb") or addr.get("neighbourhood") or addr.get("village") or ""
+            city = addr.get("city") or addr.get("town") or addr.get("municipality") or addr.get("state") or ""
+            parts = [p for p in [suburb, city] if p]
+            if not parts:
+                # Fallback to display_name but keep it short
+                display = data.get("display_name", "")
+                return display.split(",")[0].strip() if display else (fallback or "")
+            return ", ".join(parts)
+        except Exception as e:
+            print(f"[WARN] Reverse geocoding error for {lat},{lon}: {e}")
+            return fallback or ""
     
     @staticmethod
     def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

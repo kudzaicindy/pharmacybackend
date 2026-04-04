@@ -107,6 +107,39 @@ class MedicineRequest(models.Model):
         return f"Request {self.request_id} - {self.request_type}"
 
 
+class MedicineRequestRankingSnapshot(models.Model):
+    """
+    Audit trail of ranked pharmacy rows actually returned to the patient.
+    Populated when the patient hits GET .../ranked/ or the patient portal request detail.
+    """
+    snapshot_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    request = models.ForeignKey(
+        MedicineRequest,
+        on_delete=models.CASCADE,
+        related_name='ranking_snapshots',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    source = models.CharField(
+        max_length=32,
+        db_index=True,
+        help_text="ranked_api | patient_portal | chat_assistant",
+    )
+    limit_applied = models.PositiveSmallIntegerField(default=0)
+    ranked_items = models.JSONField(
+        default=list,
+        help_text="Ordered list as returned to the client (rank, scores, pharmacy ids, flags).",
+    )
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['request', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"Ranking snapshot {self.snapshot_id} for request {self.request_id}"
+
+
 class Pharmacy(models.Model):
     """Pharmacy information"""
     pharmacy_id = models.CharField(max_length=255, unique=True, primary_key=True, validators=[MinLengthValidator(3)])
@@ -120,6 +153,27 @@ class Pharmacy(models.Model):
     rating = models.FloatField(default=0, blank=True, help_text="Average rating 0-5")
     rating_count = models.IntegerField(default=0, blank=True, help_text="Number of ratings received")
     response_rate = models.FloatField(default=100, blank=True, help_text="Response rate percentage (0-100)")
+    pharmacy_type = models.CharField(
+        max_length=50,
+        blank=True,
+        default='',
+        help_text="e.g. retail, chain, hospital (admin registry)",
+    )
+    verification_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('verified', 'Verified'),
+            ('pending_review', 'Pending review'),
+            ('suspended', 'Suspended'),
+        ],
+        default='verified',
+        help_text="Registry verification pill; inactive pharmacies still show as suspended in API.",
+    )
+    last_inventory_sync_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Optional official inventory sync timestamp (otherwise max inventory.updated_at is used).",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -257,6 +311,7 @@ class Reservation(models.Model):
     )
     user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
     session_id = models.CharField(max_length=255, blank=True, help_text="For anonymous reservations")
+    patient_name = models.CharField(max_length=255, blank=True)
     patient_phone = models.CharField(max_length=50, blank=True)
 
     medicine_name = models.CharField(max_length=255)
@@ -306,6 +361,25 @@ class PharmacyRating(models.Model):
 
     def __str__(self):
         return f"{self.pharmacy.name} - {self.rating}/5"
+
+
+class AdminAuditLog(models.Model):
+    """Admin action trail for SPA control center (optional compliance / debugging)."""
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='admin_audit_logs')
+    username = models.CharField(max_length=150, blank=True)
+    action = models.CharField(max_length=120)
+    target_type = models.CharField(max_length=80, blank=True)
+    target_id = models.CharField(max_length=500, blank=True)
+    success = models.BooleanField(default=True)
+    detail = models.JSONField(default=dict, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.created_at:%Y-%m-%d %H:%M} {self.username} {self.action}"
 
 
 # ---- Patient dashboard (MediConnect) ----

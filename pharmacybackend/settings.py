@@ -5,6 +5,7 @@ Django settings for pharmacybackend project.
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import environ
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -21,6 +22,10 @@ elif _env_example.exists():
 else:
     load_dotenv()  # fallback: current directory
 
+DJANGO_USE_MONGODB = os.getenv('DJANGO_USE_MONGODB', '').lower() in ('1', 'true', 'yes')
+MONGODB_URI = os.getenv('MONGODB_URI', '').strip()
+# Optional SQLite file to read from when importing data (see import_sqlite_to_mongodb command)
+LEGACY_SQLITE_PATH = os.getenv('LEGACY_SQLITE_PATH', '').strip()
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
@@ -33,21 +38,62 @@ DEBUG = os.getenv('DEBUG', 'True') == 'True'
 
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
+# Cross-origin POSTs with session cookies (e.g. admin login from Vite) require trusted Origin.
+# Must include scheme (https://...) per Django 4+.
+CSRF_TRUSTED_ORIGINS = [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:5173',
+]
+_csrf_extra = os.getenv('CSRF_TRUSTED_ORIGINS', '').strip()
+if _csrf_extra:
+    for _origin in _csrf_extra.split(','):
+        _origin = _origin.strip()
+        if _origin and _origin not in CSRF_TRUSTED_ORIGINS:
+            CSRF_TRUSTED_ORIGINS.append(_origin)
+_cors_one = os.getenv('CORS_ORIGIN', '').strip()
+if _cors_one and _cors_one not in CSRF_TRUSTED_ORIGINS:
+    CSRF_TRUSTED_ORIGINS.append(_cors_one)
+
 
 # Application definition
 
-INSTALLED_APPS = [
-    'django.contrib.admin',
-    'django.contrib.auth',
-    'django.contrib.contenttypes',
-    'django.contrib.sessions',
-    'django.contrib.messages',
-    'django.contrib.staticfiles',
+_APPS_REST = [
     'rest_framework',
     'corsheaders',
+    'channels',
     'api',
     'chatbot',
 ]
+
+if DJANGO_USE_MONGODB:
+    if not MONGODB_URI:
+        from django.core.exceptions import ImproperlyConfigured
+        raise ImproperlyConfigured(
+            'DJANGO_USE_MONGODB is true but MONGODB_URI is missing. '
+            'Set MONGODB_URI to your Atlas or local connection string.'
+        )
+    INSTALLED_APPS = [
+        'pharmacybackend.mongo_contrib_apps.MongoAdminConfig',
+        'pharmacybackend.mongo_contrib_apps.MongoAuthConfig',
+        'pharmacybackend.mongo_contrib_apps.MongoContentTypesConfig',
+        'django.contrib.sessions',
+        'django.contrib.messages',
+        'django.contrib.staticfiles',
+        'django_mongodb_backend',
+        *_APPS_REST,
+    ]
+else:
+    INSTALLED_APPS = [
+        'django.contrib.admin',
+        'django.contrib.auth',
+        'django.contrib.contenttypes',
+        'django.contrib.sessions',
+        'django.contrib.messages',
+        'django.contrib.staticfiles',
+        *_APPS_REST,
+    ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -79,22 +125,74 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'pharmacybackend.wsgi.application'
+ASGI_APPLICATION = 'pharmacybackend.asgi.application'
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer",
+    }
+}
 
 
 # Database
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases
 
-# Using SQLite for Django admin/auth (Django ORM)
-# MongoDB will be accessed via mongoengine/pymongo directly
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
-}
+env = environ.Env()
 
-# MongoDB connection via mongoengine (configured in chatbot/apps.py)
-MONGODB_URI = os.getenv('MONGODB_URI')
+if DJANGO_USE_MONGODB:
+    from pymongo.uri_parser import parse_uri
+
+    def _mongo_db_name(uri: str) -> str:
+        name = os.getenv('MONGODB_DB_NAME', '').strip()
+        if name:
+            return name
+        try:
+            parsed = parse_uri(uri)
+            if parsed.get('database'):
+                return parsed['database']
+        except Exception:
+            pass
+        return 'pharmacybackend'
+
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django_mongodb_backend',
+            'HOST': MONGODB_URI,
+            'NAME': _mongo_db_name(MONGODB_URI),
+        }
+    }
+    DATABASE_ROUTERS = ['django_mongodb_backend.routers.MongoRouter']
+    MIGRATION_MODULES = {
+        'admin': 'mongo_migrations.admin',
+        'auth': 'mongo_migrations.auth',
+        'contenttypes': 'mongo_migrations.contenttypes',
+    }
+    if LEGACY_SQLITE_PATH:
+        _legacy_sqlite = Path(LEGACY_SQLITE_PATH)
+        if not _legacy_sqlite.is_absolute():
+            _legacy_sqlite = BASE_DIR / _legacy_sqlite
+        if _legacy_sqlite.is_file():
+            DATABASES['legacy'] = {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': _legacy_sqlite,
+            }
+            DATABASE_ROUTERS = [
+                'django_mongodb_backend.routers.MongoRouter',
+                'pharmacybackend.db_routers.LegacySqliteRouter',
+            ]
+elif os.getenv('DATABASE_URL'):
+    DATABASES = {'default': env.db_url_config(os.environ['DATABASE_URL'])}
+    DATABASE_ROUTERS = []
+    MIGRATION_MODULES = {}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
+    DATABASE_ROUTERS = []
+    MIGRATION_MODULES = {}
 
 
 # Password validation
@@ -141,7 +239,11 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+DEFAULT_AUTO_FIELD = (
+    'django_mongodb_backend.fields.ObjectIdAutoField'
+    if DJANGO_USE_MONGODB
+    else 'django.db.models.BigAutoField'
+)
 
 # REST Framework settings
 REST_FRAMEWORK = {

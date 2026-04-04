@@ -7,9 +7,14 @@ gunicorn>=21.0.0
 djangorestframework==3.14.0
 django-cors-headers==4.3.1
 python-dotenv==1.0.0
+channels==4.1.0
 pymongo==4.6.0
 mongoengine==0.27.0
 django-environ==0.11.2
+# PostgreSQL driver (when DATABASE_URL is set and not using MongoDB as Django DB)
+psycopg2-binary>=2.9.9
+# Django ORM → MongoDB (set DJANGO_USE_MONGODB=true + MONGODB_URI). Match Django 6.0.x.
+django-mongodb-backend>=6.0.2,<6.1
 Pillow>=12.0.0
 google-generativeai==0.3.2
 requests==2.31.0

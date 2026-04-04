@@ -1,28 +1,37 @@
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAdminUser
 from rest_framework.response import Response
 from rest_framework import status
 from django.utils import timezone
-from django.db.models import F
-from datetime import timedelta
+from django.db.models import F, Count, Q, Max
+from django.db.models.functions import TruncDate
+from django.http import HttpResponse
+from collections import Counter
+import csv
+from django.shortcuts import get_object_or_404
+from datetime import timedelta, datetime
 import os
 import uuid
 
 from .models import (
-    ChatConversation, ChatMessage, MedicineRequest, PharmacyResponse, Pharmacy, Pharmacist,
+    ChatConversation, ChatMessage, MedicineRequest, MedicineRequestRankingSnapshot,
+    PharmacyResponse, Pharmacy, Pharmacist,
     PharmacistDecline, PharmacyInventory, PharmacyRating, Reservation,
-    PatientProfile, SavedMedicine, PatientNotification,
+    PatientProfile, SavedMedicine, PatientNotification, AdminAuditLog,
 )
 from .serializers import (
     ChatRequestSerializer, ChatResponseSerializer,
     ChatConversationSerializer, MedicineRequestSerializer,
     PharmacyResponseSerializer, PharmacistSerializer, PharmacistLoginSerializer,
+    AdminLoginSerializer,
     PharmacyRegistrationSerializer, PharmacistRegistrationSerializer,
     PharmacySerializer
 )
 from .services import LocationService, OCRService, RankingEngine, DrugInteractionService
 from django.core.files.storage import default_storage
 from django.conf import settings
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 
 # Lazy import to avoid protobuf issues on startup
 _chatbot_service = None
@@ -685,17 +694,35 @@ def chat(request):
             # Final filter: remove any non-medicine garbage before creating request
             medicines_to_use = _filter_valid_medicines(medicines_to_use) if medicines_to_use else []
             
-            # LIVE INVENTORY PATH: when we have location + medicines, query live inventory first (implementation guide flow)
+            # Always create and broadcast the medicine request so pharmacists see it in their dashboard
+            print(f"[INFO] Creating medicine request: intent={request_intent}, medicines={medicines_to_use}, symptoms={symptoms_text[:50] if symptoms_text else 'None'}")
+            medicine_request = create_medicine_request(
+                conversation=conversation,
+                user=request.user if request.user.is_authenticated else None,
+                intent=request_intent,
+                medicines=medicines_to_use,
+                symptoms=symptoms_text,
+                latitude=location_lat,
+                longitude=location_lon,
+                address=data.get('location_address', ''),
+                suburb=data.get('location_suburb', '')
+            )
+            medicine_request_id = medicine_request.request_id
+            is_new_request = True
+            print(f"[INFO] Medicine request created: {medicine_request_id} (intent: {request_intent}, status: {medicine_request.status})")
+
+            # Also query live inventory: if pharmacies have stock in DB, show those immediately (patient can reserve)
             live_results = []
             if medicines_to_use and location_lat and location_lon:
                 live_results = get_live_inventory_ranked(location_lat, location_lon, medicines_to_use, limit=10)
                 if not live_results:
-                    print(f"[INFO] Live inventory: 0 results for {medicines_to_use} at ({location_lat},{location_lon}); falling back to request + pharmacist responses")
+                    print(f"[INFO] Live inventory: 0 results for {medicines_to_use} at ({location_lat},{location_lon})")
             if live_results:
                 pharmacy_responses = list(live_results)
-                # Merge in pharmacist responses (symptom/prescription requests): include pharmacies that responded
-                # with availability or alternatives so patient sees both live stock and pharmacist suggestions
-                if existing_request and existing_request.pharmacy_responses.exists():
+                # For a brand new request, show LIVE stock first on its own.
+                # Pharmacist responses (if any) will be surfaced on follow-up/poll
+                # as \"new\" responses instead of being merged into this first view.
+                if not is_new_request and existing_request and existing_request.pharmacy_responses.exists():
                     pharmacist_responses = get_ranked_pharmacy_responses(existing_request, limit=10)
                     live_pharmacy_ids = {r.get('pharmacy_id') for r in pharmacy_responses if r.get('pharmacy_id')}
                     for pr in pharmacist_responses:
@@ -705,28 +732,10 @@ def chat(request):
                             pr['from_live_inventory'] = False
                             pharmacy_responses.append(pr)
                             live_pharmacy_ids.add(pid)
-                    if len(pharmacist_responses) > 0:
-                        print(f"[INFO] Merged {len(pharmacist_responses)} pharmacist response(s) with {len(live_results)} live inventory result(s)")
-                print(f"[INFO] Live inventory: found {len(live_results)} pharmacies with stock; showing ranked results (40/30/20/10)")
-                # Do not create a request; patient sees results immediately and can reserve
+                print(f"[INFO] Live inventory: {len(live_results)} pharmacies with stock; request {medicine_request_id} also sent to pharmacists")
             else:
-                print(f"[INFO] Creating medicine request: intent={request_intent}, medicines={medicines_to_use}, symptoms={symptoms_text[:50] if symptoms_text else 'None'}")
-                medicine_request = create_medicine_request(
-                    conversation=conversation,
-                    user=request.user if request.user.is_authenticated else None,
-                    intent=request_intent,
-                    medicines=medicines_to_use,
-                    symptoms=symptoms_text,
-                    latitude=location_lat,
-                    longitude=location_lon,
-                    address=data.get('location_address', ''),
-                    suburb=data.get('location_suburb', '')
-                )
-                medicine_request_id = medicine_request.request_id
-                is_new_request = True
-                print(f"[INFO] Medicine request created: {medicine_request_id} (intent: {request_intent}, status: {medicine_request.status})")
                 pharmacy_responses = None
-                print(f"[INFO] New request {medicine_request_id} created and broadcasting - waiting for pharmacists to respond")
+                print(f"[INFO] Request {medicine_request_id} sent to pharmacists - waiting for responses")
     elif intent in ['medicine_search', 'symptom_description', 'medicine_selection'] or has_symptom or has_medicine_intent:
         # Location not provided - AI will ask for it (symptom flow: suggest → confirm → location)
         print(f"[INFO] Medicine request pending - waiting for location (intent: {intent})")
@@ -766,39 +775,54 @@ def chat(request):
     
     # Check if we've already shown responses to this conversation
     already_shown_responses = False
+    new_arrivals_only = False  # True when showing only responses that arrived after the last message
     if existing_request and not is_new_request and pharmacy_responses:
         # Check recent messages to see if we already sent pharmacy responses
-        # Look for assistant messages that contain pharmacy_responses in response data
         recent_ai_messages = ChatMessage.objects.filter(
             conversation=conversation,
             role='assistant'
-        ).order_by('-created_at')[:5]  # Check last 5 messages
+        ).order_by('-created_at')[:5]
         
         for msg in recent_ai_messages:
-            # Check if metadata indicates we showed responses
-            if msg.metadata and isinstance(msg.metadata, dict):
-                if msg.metadata.get('pharmacy_responses_shown'):
-                    # We've already shown responses - only show if new ones were added
-                    last_response_time = msg.created_at
-                    new_responses_count = existing_request.pharmacy_responses.filter(
-                        submitted_at__gt=last_response_time
-                    ).count()
-                    
-                    if new_responses_count == 0:
-                        already_shown_responses = True
-                        pharmacy_responses = None  # Don't show again
-                        print(f"[INFO] Responses already shown for request {existing_request.request_id}, no new responses")
-                    else:
-                        print(f"[INFO] Found {new_responses_count} new responses since last shown")
-                    break
+            if msg.metadata and isinstance(msg.metadata, dict) and msg.metadata.get('pharmacy_responses_shown'):
+                last_response_time = msg.created_at
+                new_responses_count = existing_request.pharmacy_responses.filter(
+                    submitted_at__gt=last_response_time
+                ).count()
+                
+                if new_responses_count == 0:
+                    already_shown_responses = True
+                    pharmacy_responses = None
+                    print(f"[INFO] Responses already shown for request {existing_request.request_id}, no new responses")
+                else:
+                    # Filter to only responses submitted after we last showed results
+                    def _submitted_after(r, cutoff):
+                        t = r.get('submitted_at')
+                        if not t:
+                            return False
+                        if hasattr(t, 'timestamp'):
+                            if timezone.is_naive(t) and timezone.is_aware(cutoff):
+                                t = timezone.make_aware(t, timezone.utc)
+                            return t > cutoff
+                        try:
+                            parsed = datetime.fromisoformat(str(t).replace('Z', '+00:00'))
+                            if timezone.is_naive(parsed) and timezone.is_aware(cutoff):
+                                parsed = timezone.make_aware(parsed, timezone.utc)
+                            return parsed > cutoff
+                        except Exception:
+                            return False
+                    pharmacy_responses = [r for r in pharmacy_responses if _submitted_after(r, last_response_time)]
+                    if pharmacy_responses:
+                        new_arrivals_only = True
+                        print(f"[INFO] Showing {len(pharmacy_responses)} new pharmacy response(s) (arrived after last message)")
+                break
     
     # If we have pharmacy responses and haven't shown them yet, return them instead of AI response
     if pharmacy_responses and not already_shown_responses:
-        # Generate recommendation for best pharmacy
         best_pharmacy = pharmacy_responses[0] if pharmacy_responses else None
         recommendation = None
         
-        if best_pharmacy:
+        if best_pharmacy and not new_arrivals_only:
             reasons = []
             if best_pharmacy.get('medicine_available'):
                 reasons.append("medicine is available")
@@ -809,7 +833,6 @@ def chat(request):
                     reasons.append(f"ready in {best_pharmacy['total_time_minutes']} minutes")
                 if best_pharmacy.get('price'):
                     reasons.append(f"best price: ${best_pharmacy['price']}")
-            
             reason_text = ", ".join(reasons[:3]) if reasons else "best overall option"
             recommendation = {
                 'recommended_pharmacy': best_pharmacy.get('pharmacy_name'),
@@ -818,11 +841,39 @@ def chat(request):
                 'ranking_score': best_pharmacy.get('ranking_score')
             }
         
-        from_live = bool(pharmacy_responses and pharmacy_responses[0].get('from_live_inventory'))
-        req_id_for_short = medicine_request_id if not from_live else None
+        from_live = bool(pharmacy_responses and pharmacy_responses[0].get('from_live_inventory') and not new_arrivals_only)
+        # Always include medicine_request_id so frontend can consistently
+        # track and update the specific request, even when results are from
+        # live inventory.
+        req_id_for_short = medicine_request_id
         short_req_id = str(req_id_for_short).replace('-', '')[:8].upper() if req_id_for_short else None
+        
+        # Message text: different when showing new arrivals so frontend can display "Pharmacy X responded they have..."
+        if new_arrivals_only:
+            parts = []
+            for r in pharmacy_responses:
+                name = r.get('pharmacy_name') or r.get('pharmacy_id') or 'A pharmacy'
+                items = []
+                for mr in (r.get('medicine_responses') or []):
+                    if isinstance(mr, dict) and mr.get('available'):
+                        m = mr.get('medicine', '')
+                        p = mr.get('price')
+                        items.append(f"{m}" + (f" (${p})" if p else ""))
+                if not items and r.get('notes'):
+                    items = [r.get('notes')]
+                if not items:
+                    items = ["stock available"] if r.get('medicine_available') else ["see details below"]
+                parts.append(f"**{name}** responded they have: {', '.join(items)}.")
+            response_text = "✅ New response(s): " + " ".join(parts)
+        else:
+            response_text = (
+                f"✅ I found {len(pharmacy_responses)} {'pharmacies' if len(pharmacy_responses) != 1 else 'pharmacy'} with live stock. Here are the top ranked options (distance, price, availability, rating):"
+                if from_live
+                else f"✅ Your request has been sent to nearby pharmacies! I found {len(pharmacy_responses)} top {'pharmacies' if len(pharmacy_responses) != 1 else 'pharmacy'} with available options. Here are the top ranked responses:"
+            )
+        
         response_data = {
-            'response': f"✅ I found {len(pharmacy_responses)} {'pharmacies' if len(pharmacy_responses) != 1 else 'pharmacy'} with live stock. Here are the top ranked options (distance, price, availability, rating):" if from_live else f"✅ Your request has been sent to nearby pharmacies! I found {len(pharmacy_responses)} top {'pharmacies' if len(pharmacy_responses) != 1 else 'pharmacy'} with available options. Here are the top ranked responses:",
+            'response': response_text,
             'conversation_id': conversation.conversation_id,
             'message_id': ai_message.message_id,
             'intent': 'medicine_search',
@@ -837,10 +888,22 @@ def chat(request):
             'results_for_request_id': str(req_id_for_short) if req_id_for_short else None,
             'from_live_inventory': from_live,
             'live_results_note': 'Results are from current stock. Other pharmacies may have added stock; search again or refresh to see the latest.' if from_live else None,
+            'is_new_pharmacy_responses': new_arrivals_only,
+            'last_user_message': message,
         }
+        if req_id_for_short:
+            try:
+                _mr = MedicineRequest.objects.get(request_id=req_id_for_short)
+                persist_medicine_request_ranking_snapshot(
+                    _mr,
+                    pharmacy_responses,
+                    'chat_assistant',
+                    limit_applied=len(pharmacy_responses),
+                )
+            except MedicineRequest.DoesNotExist:
+                pass
         
-        # Mark in message metadata that we've shown responses
-        ai_message.metadata = {'pharmacy_responses_shown': True, 'total_responses': len(pharmacy_responses)}
+        ai_message.metadata = {'pharmacy_responses_shown': True, 'total_responses': len(pharmacy_responses), 'new_arrivals_only': new_arrivals_only}
         ai_message.save(update_fields=['metadata'])
         # Persist suggested_medicines to conversation so Reserve can use them when frontend sends only conversation_id + pharmacy_id
         if medicines:
@@ -889,6 +952,13 @@ def chat(request):
                 if to_save:
                     conversation.context_metadata['suggested_medicines'] = list(to_save)
                     conversation.save(update_fields=['context_metadata'])
+                if ranked_responses:
+                    persist_medicine_request_ranking_snapshot(
+                        medicine_request,
+                        ranked_responses,
+                        'chat_assistant',
+                        limit_applied=3,
+                    )
             else:
                 # No responses yet - include poll hint so frontend can check for responses without user sending another message
                 conversation_id_str = str(conversation.conversation_id)
@@ -1076,6 +1146,55 @@ def broadcast_to_pharmacies(medicine_request):
 RANKING_DELAY_MINUTES = 2  # Apply MCDA ranking only after this many minutes from request creation
 
 
+def _ranking_snapshot_json_safe(obj):
+    """Make ranked-response payloads JSON-safe for MedicineRequestRankingSnapshot.ranked_items."""
+    from decimal import Decimal
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {str(k): _ranking_snapshot_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_ranking_snapshot_json_safe(v) for v in obj]
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+
+
+def persist_medicine_request_ranking_snapshot(medicine_request, ranked_items, source, limit_applied):
+    """
+    Store the exact ranked list shown to the patient. Skips a new row if the payload
+    matches the latest snapshot (same hash), so repeated identical polls do not spam the DB.
+    """
+    import json
+    from hashlib import sha256
+
+    safe_items = _ranking_snapshot_json_safe(ranked_items)
+    if not isinstance(safe_items, list):
+        safe_items = []
+    blob = json.dumps(safe_items, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    fingerprint = sha256(blob).hexdigest()
+    prev = (
+        MedicineRequestRankingSnapshot.objects.filter(request=medicine_request)
+        .order_by('-created_at')
+        .first()
+    )
+    if prev:
+        prev_fp = sha256(
+            json.dumps(prev.ranked_items, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        ).hexdigest()
+        if prev_fp == fingerprint:
+            return
+    MedicineRequestRankingSnapshot.objects.create(
+        request=medicine_request,
+        source=(source or '')[:32],
+        limit_applied=limit_applied,
+        ranked_items=safe_items,
+    )
+
+
 def get_ranked_pharmacy_responses(medicine_request, limit=3):
     """
     Get pharmacy responses for a medicine request.
@@ -1220,11 +1339,30 @@ def get_ranked_pharmacy_responses(medicine_request, limit=3):
         requested_medicines_lower = [m.lower() for m in requested_medicines]
         
         # ALWAYS check inventory first (source of truth - decreased when patients buy or pharmacists edit)
-        inventory_by_medicine = {}
+        # Store both quantity and price so we show LIVE stock to the patient, not the old response snapshot
+        inventory_by_medicine = {}  # medicine_name_lower -> {'quantity': int, 'price': str or None}
         if response.pharmacy:
             for inv in PharmacyInventory.objects.filter(pharmacy=response.pharmacy, quantity__gt=F('reserved_quantity')):
-                inventory_by_medicine[inv.medicine_name.lower()] = inv.quantity - inv.reserved_quantity
+                qty = inv.quantity - inv.reserved_quantity
+                price_str = str(inv.price) if inv.price is not None else None
+                inventory_by_medicine[inv.medicine_name.lower()] = {'quantity': qty, 'price': price_str}
         
+        # Helper: get quantity from inventory (supports fuzzy match)
+        def _live_qty(med_lower):
+            if med_lower in inventory_by_medicine:
+                return inventory_by_medicine[med_lower]['quantity']
+            for inv_name, data in inventory_by_medicine.items():
+                if med_lower in inv_name or inv_name in med_lower:
+                    return data['quantity']
+            return None
+        def _live_price(med_lower):
+            if med_lower in inventory_by_medicine:
+                return inventory_by_medicine[med_lower]['price']
+            for inv_name, data in inventory_by_medicine.items():
+                if med_lower in inv_name or inv_name in med_lower:
+                    return data['price']
+            return None
+
         # Determine availability: ALWAYS check inventory first (source of truth)
         if requested_medicines and inventory_by_medicine:
             found_in_inv = False
@@ -1352,57 +1490,224 @@ def get_ranked_pharmacy_responses(medicine_request, limit=3):
                         alternatives_by_medicine[for_med.lower()] = []
                     alternatives_by_medicine[for_med.lower()].append(alt.get('medicine'))
         
-        # Create per-medicine breakdown
+        # Full per-medicine rows from DB (serializer can differ from model in edge cases).
+        def _mr_available(mr):
+            if not isinstance(mr, dict):
+                return False
+            v = mr.get('available')
+            if v is True:
+                return True
+            if isinstance(v, str) and v.lower() in ('true', '1', 'yes'):
+                return True
+            return False
+
+        # Fresh read from DB + merge serializer rows (fixes missing extras like amoxicillin
+        # when ORM cache vs API payload differ).
+        _mr_db = PharmacyResponse.objects.filter(
+            response_id=response.response_id
+        ).values_list('medicine_responses', flat=True).first()
+        if not isinstance(_mr_db, list):
+            _mr_db = []
+        raw_pharmacist_mr = []
+        _seen_med = set()
+        for mr in _mr_db:
+            try:
+                if isinstance(mr, dict):
+                    row = dict(mr)
+                elif hasattr(mr, 'keys'):
+                    row = {k: mr[k] for k in mr.keys()}
+                else:
+                    continue
+                k = str(row.get('medicine', '')).strip().lower()
+                if not k:
+                    continue
+                raw_pharmacist_mr.append(row)
+                _seen_med.add(k)
+            except Exception:
+                continue
+        for mr in (response_data.get('medicine_responses') or []):
+            try:
+                if not isinstance(mr, dict):
+                    continue
+                k = str(mr.get('medicine', '')).strip().lower()
+                if not k or k in _seen_med:
+                    continue
+                raw_pharmacist_mr.append(dict(mr))
+                _seen_med.add(k)
+            except Exception:
+                continue
+
+        pharmacist_available_meds = set()
+        for row in raw_pharmacist_mr:
+            if _mr_available(row):
+                name = str(row.get('medicine', '')).strip().lower()
+                if name:
+                    pharmacist_available_meds.add(name)
+
+        # Create per-medicine breakdown (use LIVE inventory for quantity/price so UI matches DB)
         # If requested_medicines exist, show breakdown per medicine
         # Otherwise, show general availability
         if requested_medicines:
             for req_med in requested_medicines:
                 req_med_lower = req_med.lower()
+                live_qty = _live_qty(req_med_lower)
+                live_pr = _live_price(req_med_lower)
                 medicine_status = {
                     'medicine': req_med,
                     'available': False,
                     'price': None,
+                    'quantity': live_qty,  # live stock from PharmacyInventory
                     'alternative': None
                 }
                 
-                # Use effective availability (includes notes parsing, inventory check)
-                effective_available = response_data.get('medicine_available', response.medicine_available)
+                # Use pharmacist availability + inventory as source of truth.
+                # A medicine is "available" if either:
+                #   - it appears as available in pharmacist medicine_responses, OR
+                #   - it exists in live inventory with quantity > 0.
+                effective_available = False
+                if req_med_lower in pharmacist_available_meds:
+                    effective_available = True
                 effective_price = response_data.get('price') or (str(response.price) if response.price else None)
+                # Prefer live inventory price when available
+                if live_pr is not None:
+                    medicine_status['price'] = live_pr
+                elif len(requested_medicines) == 1:
+                    medicine_status['price'] = effective_price
                 # Check if this medicine has alternatives (suggesting it's unavailable)
                 if req_med_lower in alternatives_by_medicine:
                     medicine_status['available'] = False
                     medicine_status['alternative'] = alternatives_by_medicine[req_med_lower][0]
                 elif effective_available:
                     medicine_status['available'] = True
-                    if len(requested_medicines) == 1:
+                    if medicine_status['price'] is None and len(requested_medicines) == 1:
                         medicine_status['price'] = effective_price
-                    else:
-                        medicine_status['price'] = None
                 else:
                     # Check inventory - source of truth (decreased on purchase/edit)
                     in_inv = req_med_lower in inventory_by_medicine
                     if not in_inv:
                         for inv_name in inventory_by_medicine:
-                            if req_med_lower in inv_name or inv_name in req_lower:
+                            if req_med_lower in inv_name or inv_name in req_med_lower:
                                 in_inv = True
                                 break
                     medicine_status['available'] = in_inv
-                    if in_inv and len(requested_medicines) == 1 and effective_price:
+                    if in_inv and medicine_status['price'] is None and len(requested_medicines) == 1 and effective_price:
                         medicine_status['price'] = effective_price
                 
                 medicines_breakdown.append(medicine_status)
+
+            # Medicines the pharmacist offered that were NOT in the patient's search — still show them.
+            req_lower_set = {m.lower() for m in requested_medicines}
+            seen_extra = set()
+            for mr in raw_pharmacist_mr:
+                if not isinstance(mr, dict) or not _mr_available(mr):
+                    continue
+                med_name = str(mr.get('medicine', '')).strip()
+                if not med_name:
+                    continue
+                key = med_name.lower()
+                if key in req_lower_set or key in seen_extra:
+                    continue
+                seen_extra.add(key)
+                live_qty = _live_qty(key)
+                live_pr = _live_price(key)
+                ph_price = mr.get('price')
+                ph_qty = mr.get('quantity')
+                try:
+                    ph_qty_int = int(ph_qty) if ph_qty is not None and str(ph_qty).strip() != '' else None
+                except (TypeError, ValueError):
+                    ph_qty_int = None
+                medicines_breakdown.append({
+                    'medicine': med_name,
+                    'available': True,
+                    'price': live_pr if live_pr is not None else (str(ph_price) if ph_price not in (None, '') else None),
+                    'quantity': live_qty if live_qty is not None else ph_qty_int,
+                    'alternative': None,
+                    'from_pharmacist_only': True,
+                })
         else:
-            # No specific medicines requested (symptom-based search)
-            # Show general availability
-            medicines_breakdown.append({
-                'medicine': 'Requested medicines',
-                'available': response.medicine_available,
-                'price': str(response.price) if response.price and response.medicine_available else None,
-                'alternative': None
-            })
+            # No medicine_names on request (symptom / legacy). Use pharmacist medicine_responses first
+            # so we do not replace real rows with placeholder and then drop them from medicine_responses.
+            seen_symptom = set()
+            for mr in raw_pharmacist_mr:
+                if not isinstance(mr, dict):
+                    continue
+                med_name = str(mr.get('medicine', '')).strip()
+                if not med_name:
+                    continue
+                key = med_name.lower()
+                if key == 'requested medicines':
+                    continue
+                if key in seen_symptom:
+                    continue
+                seen_symptom.add(key)
+                live_qty = _live_qty(key)
+                live_pr = _live_price(key)
+                ph_price = mr.get('price')
+                ph_qty = mr.get('quantity')
+                exp = mr.get('expiry')
+                if exp is None:
+                    exp = mr.get('expiry_date')
+                try:
+                    ph_qty_int = int(ph_qty) if ph_qty is not None and str(ph_qty).strip() != '' else None
+                except (TypeError, ValueError):
+                    ph_qty_int = None
+                alt = mr.get('alternative')
+                medicines_breakdown.append({
+                    'medicine': med_name,
+                    'available': _mr_available(mr),
+                    'price': live_pr if live_pr is not None else (str(ph_price) if ph_price not in (None, '') else None),
+                    'quantity': live_qty if live_qty is not None else ph_qty_int,
+                    'expiry': exp,
+                    'alternative': alt,
+                })
+            if not medicines_breakdown:
+                medicines_breakdown.append({
+                    'medicine': 'Requested medicines',
+                    'available': response.medicine_available,
+                    'price': str(response.price) if response.price and response.medicine_available else None,
+                    'alternative': None,
+                })
         
         # Add per-medicine breakdown to response
         response_data['medicines'] = medicines_breakdown
+        
+        # Patient-facing list: requested meds (live + pharmacist) plus extra meds only pharmacist listed.
+        if requested_medicines or medicines_breakdown:
+            response_data['medicine_responses'] = []
+            for m in medicines_breakdown:
+                if m.get('medicine') == 'Requested medicines':
+                    continue
+                pr = m.get('price')
+                row_m = {
+                    'medicine': m['medicine'],
+                    'available': m['available'],
+                    'price': pr if pr is not None else 'N/A',
+                    'quantity': m.get('quantity'),
+                    'expiry': m.get('expiry'),
+                    'alternative': m.get('alternative'),
+                    'from_pharmacist_only': bool(m.get('from_pharmacist_only')),
+                }
+                response_data['medicine_responses'].append(row_m)
+            # Symptom-only path: no requested_medicines rows in list — parse notes if needed
+            if not response_data['medicine_responses'] and not requested_medicines:
+                if response_data.get('price') and response_data.get('notes'):
+                    try:
+                        import re as _re_local_sym
+                        raw_note = str(response_data.get('notes') or '').strip()
+                        m_note = _re_local_sym.match(r"\s*([A-Za-z0-9\s]+?)(?:\s*\$?\s*(\d+(?:\.\d{1,2})?))?\s*$", raw_note)
+                    except Exception:
+                        m_note = None
+                    if m_note:
+                        med_name = m_note.group(1).strip()
+                        price_from_note = m_note.group(2) or response_data.get('price')
+                        if med_name:
+                            response_data['medicine_responses'] = [{
+                                'medicine': med_name,
+                                'available': True,
+                                'price': str(price_from_note),
+                                'quantity': None,
+                                'from_pharmacist_only': False,
+                            }]
         
         # Also add requested medicines to response for frontend reference
         response_data['requested_medicines'] = requested_medicines
@@ -2013,11 +2318,11 @@ def get_pharmacist_requests(request):
         Q(status__in=['completed', 'expired'], pharmacy_responses__pharmacist=pharmacist)
     ).distinct().order_by('-created_at')
     
-    # If pharmacist's pharmacy has location, filter nearby requests
-    # Use a reasonable radius for Zimbabwe (50km - covers most urban areas)
+    # Previously we hid active requests beyond 50km. For pharmacist dashboards
+    # it's more useful to show *all* relevant requests and simply annotate
+    # distance, so pharmacists can decide. So we no longer filter out by
+    # distance; we just calculate it when coordinates are available.
     from .services import LocationService
-    MAX_DISTANCE_KM = 50.0  # Maximum distance to show ACTIVE requests (50km radius)
-    # Note: Completed requests are shown regardless of distance (they're history)
     nearby_requests = []
     
     if pharmacist.pharmacy and pharmacist.pharmacy.latitude and pharmacist.pharmacy.longitude:
@@ -2037,11 +2342,9 @@ def get_pharmacist_requests(request):
                     pharmacy_lat,
                     pharmacy_lon
                 )
-                # Show if: (1) within MAX_DISTANCE_KM OR (2) completed/expired (history)
-                if distance <= MAX_DISTANCE_KM or is_completed:
-                    nearby_requests.append((req, distance))
-                else:
-                    print(f"[INFO] Active request {req.request_id} is {distance:.2f}km away (beyond {MAX_DISTANCE_KM}km limit), not showing to pharmacist {pharmacist_id}")
+                # Always include the request, but record the distance so UI
+                # can sort or display it. No radius filtering here.
+                nearby_requests.append((req, distance))
             else:
                 # Include requests without location (show all)
                 # These requests don't have coordinates, so we can't filter by distance
@@ -2195,7 +2498,38 @@ def submit_pharmacy_response(request, request_id):
             # Continue without distance/time if calculation fails
     
     # Handle per-medicine responses (if provided)
-    medicine_responses = request.data.get('medicine_responses', [])
+    medicine_responses = request.data.get('medicine_responses', []) or []
+    
+    # If pharmacist only typed a simple note like "cough syrup $1" and did not
+    # add a structured row for it, convert that note into a medicine_responses
+    # entry so the chatbot/frontend show it as a proper medicine line.
+    if isinstance(medicine_responses, list) and notes_text.strip():
+        raw = notes_text.strip()
+        try:
+            import re as _re_local
+            m = _re_local.match(r"\s*([A-Za-z0-9\s]+?)(?:\s*\$?\s*(\d+(?:\.\d{1,2})?))?\s*$", raw)
+        except Exception:
+            m = None
+        if m:
+            med_name = m.group(1).strip()
+            price_from_notes = m.group(2)
+            if med_name:
+                exists = any(
+                    isinstance(item, dict)
+                    and str(item.get('medicine', '')).strip().lower() == med_name.lower()
+                    for item in medicine_responses
+                )
+                if not exists:
+                    med_entry = {
+                        'medicine': med_name,
+                        'available': True,
+                        'price': price_from_notes or None,
+                        'quantity': None,
+                        'expiry': None,
+                        'alternative': None,
+                    }
+                    medicine_responses.append(med_entry)
+                    request.data['medicine_responses'] = medicine_responses
     
     # If medicine_responses is provided, calculate overall availability and price from it
     if medicine_responses:
@@ -2278,6 +2612,24 @@ def submit_pharmacy_response(request, request_id):
     medicine_request.save(update_fields=['status'])
     
     serializer = PharmacyResponseSerializer(response_obj)
+
+    # Broadcast websocket event so the patient's UI can refresh immediately
+    try:
+        channel_layer = get_channel_layer()
+        if channel_layer:
+            group_name = f"chat_request_{medicine_request.request_id}"
+            async_to_sync(channel_layer.group_send)(
+                group_name,
+                {
+                    "type": "chatbot_update",
+                    "data": {
+                        "event": "pharmacy_response",
+                        "medicine_request_id": str(medicine_request.request_id),
+                    },
+                },
+            )
+    except Exception as e:
+        print(f"[WARNING] Failed to broadcast pharmacy_response websocket event: {e}")
 
     # Create patient notification when a pharmacy responds
     try:
@@ -2485,7 +2837,9 @@ def pharmacist_reservations_list(request):
         expires_at__gt=now,
     ).order_by('reserved_at')
     out = []
+    _res_cache = {}
     for r in pending:
+        patient_name, patient_location = _reservation_patient_name_and_location(r, _res_cache)
         out.append({
             'reservation_id': str(r.reservation_id),
             'medicine_name': r.medicine_name,
@@ -2494,7 +2848,9 @@ def pharmacist_reservations_list(request):
             'status': r.status,
             'reserved_at': r.reserved_at.isoformat(),
             'expires_at': r.expires_at.isoformat(),
+            'patient_name': patient_name,
             'patient_phone': r.patient_phone or '',
+            'patient_location': patient_location,
         })
     return Response({'pharmacy_id': pharmacy.pharmacy_id, 'reservations': out}, status=status.HTTP_200_OK)
 
@@ -2594,7 +2950,7 @@ def pharmacist_reservation_complete(request, reservation_id):
 def reserve_medicine(request):
     """
     Reserve medicine at a pharmacy (locks stock for 2 hours).
-    Body: { "pharmacy_id": "str", "medicine_name": "str (optional if conversation_id provided)", "quantity": 1, "conversation_id": "uuid" or "session_id": "str", "patient_phone": "optional" }
+    Body: { "pharmacy_id": "str", "medicine_name": "str (optional if conversation_id provided)", "quantity": 1, "conversation_id": "uuid" or "session_id": "str", "patient_name": "optional", "patient_phone": "optional" }
     If medicine_name is omitted but conversation_id is sent, the first suggested_medicine from that conversation is used.
     Concurrency-safe: uses select_for_update so simultaneous reservations see correct available count.
     """
@@ -2604,6 +2960,7 @@ def reserve_medicine(request):
     quantity = max(1, int(request.data.get('quantity', 1)))
     conversation_id = request.data.get('conversation_id')
     session_id = request.data.get('session_id', '')
+    patient_name = (request.data.get('patient_name') or '').strip()
     patient_phone = (request.data.get('patient_phone') or '').strip()
 
     if not pharmacy_id:
@@ -2631,6 +2988,13 @@ def reserve_medicine(request):
                     medicine_name = (first if isinstance(first, str) else str(first)).strip()
         except ChatConversation.DoesNotExist:
             pass
+
+    if not patient_name and session_id:
+        profile = PatientProfile.objects.filter(session_id=session_id).first()
+        if profile:
+            patient_name = (profile.display_name or '').strip()
+            if not patient_phone:
+                patient_phone = (profile.phone or '').strip()
 
     if not medicine_name:
         return Response(
@@ -2661,6 +3025,7 @@ def reserve_medicine(request):
             pharmacy=pharmacy,
             conversation=conversation,
             session_id=session_id or str(uuid.uuid4()),
+            patient_name=patient_name,
             patient_phone=patient_phone,
             medicine_name=inv.medicine_name,
             quantity=quantity,
@@ -2817,8 +3182,13 @@ def get_ranked_responses(request, request_id):
                 return s  # already 0-1, higher better
             return 1 / (1 + s) if s >= 0 else 0  # MCDA: lower better -> convert to higher better
         ranked_responses.sort(key=_score_key, reverse=True)
-        
-        return Response(ranked_responses[:limit], status=status.HTTP_200_OK)
+
+        payload = ranked_responses[:limit]
+        persist_medicine_request_ranking_snapshot(
+            medicine_request, payload, 'ranked_api', limit_applied=limit,
+        )
+
+        return Response(payload, status=status.HTTP_200_OK)
     
     except MedicineRequest.DoesNotExist:
         return Response(
@@ -3122,6 +3492,612 @@ def list_pharmacists(request, pharmacy_id=None):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 
+def _admin_user_payload(user):
+    return {
+        'id': str(user.pk) if user.pk is not None else None,
+        'username': user.username,
+        'email': getattr(user, 'email', '') or '',
+        'is_staff': user.is_staff,
+        'is_superuser': user.is_superuser,
+    }
+
+
+def _location_text_from_request_fields(location_suburb, location_address, latitude, longitude):
+    """Build human-friendly area text from request location fields."""
+    from .services import LocationService
+
+    raw_area = location_suburb or location_address or ''
+    if (not raw_area or raw_area.startswith('Location:')) and latitude and longitude:
+        return LocationService.reverse_geocode(latitude, longitude, fallback=raw_area)
+    return raw_area
+
+
+def _reservation_patient_name_and_location(reservation, cache=None):
+    """
+    Resolve patient_name and patient_location for a reservation.
+    Sources:
+    - reservation.patient_name
+    - PatientProfile.display_name/home_area by session_id
+    - latest MedicineRequest location by conversation/session
+    """
+    cache = cache or {}
+    conv_cache = cache.setdefault('conv_request', {})
+    sess_cache = cache.setdefault('sess_request', {})
+    profile_cache = cache.setdefault('profile', {})
+
+    session_id = reservation.session_id or (reservation.conversation.session_id if reservation.conversation else '')
+    conversation_id = str(reservation.conversation.conversation_id) if reservation.conversation else None
+
+    profile = None
+    if session_id:
+        if session_id in profile_cache:
+            profile = profile_cache[session_id]
+        else:
+            profile = PatientProfile.objects.filter(session_id=session_id).first()
+            profile_cache[session_id] = profile
+
+    patient_name = (reservation.patient_name or '').strip()
+    if not patient_name and profile:
+        patient_name = (profile.display_name or '').strip()
+
+    req = None
+    if conversation_id:
+        if conversation_id in conv_cache:
+            req = conv_cache[conversation_id]
+        else:
+            req = MedicineRequest.objects.filter(conversation=reservation.conversation).order_by('-created_at').first()
+            conv_cache[conversation_id] = req
+    elif session_id:
+        if session_id in sess_cache:
+            req = sess_cache[session_id]
+        else:
+            req = MedicineRequest.objects.filter(conversation__session_id=session_id).order_by('-created_at').first()
+            sess_cache[session_id] = req
+
+    patient_location = ''
+    if req:
+        patient_location = _location_text_from_request_fields(
+            req.location_suburb,
+            req.location_address,
+            req.location_latitude,
+            req.location_longitude,
+        )
+    if not patient_location and profile:
+        patient_location = profile.home_area or ''
+
+    return patient_name, patient_location
+
+
+def _city_from_address(address):
+    if not address:
+        return ''
+    parts = [p.strip() for p in str(address).split(',') if p.strip()]
+    if len(parts) >= 2:
+        return parts[-1]
+    return parts[0] if parts else ''
+
+
+def _pharmacy_registry_pill_status(pharmacy):
+    """Registry status pill: verified | pending_review | suspended."""
+    if not pharmacy.is_active:
+        return 'suspended'
+    vs = getattr(pharmacy, 'verification_status', None) or 'verified'
+    if vs == 'suspended':
+        return 'suspended'
+    if vs == 'pending_review':
+        return 'pending_review'
+    return 'verified'
+
+
+def _client_ip(request):
+    xff = request.META.get('HTTP_X_FORWARDED_FOR')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR') or ''
+
+
+def _log_admin_action(request, action, target_type='', target_id='', detail=None, success=True):
+    try:
+        AdminAuditLog.objects.create(
+            user=request.user if getattr(request, 'user', None) and request.user.is_authenticated else None,
+            username=(
+                request.user.get_username()
+                if getattr(request, 'user', None) and request.user.is_authenticated
+                else ''
+            ),
+            action=action,
+            target_type=target_type,
+            target_id=str(target_id)[:500] if target_id is not None else '',
+            success=success,
+            detail=detail or {},
+            ip_address=_client_ip(request) or None,
+        )
+    except Exception as e:
+        print(f'[WARN] AdminAuditLog failed: {e}')
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def admin_login(request):
+    """
+    POST /api/chatbot/admin/login/
+    Body: { "username": "...", "password": "..." } or { "email": "...", "password": "..." }
+    Establishes Django session; use credentials/cookies on subsequent admin API calls.
+    """
+    serializer = AdminLoginSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    from django.contrib.auth import authenticate, login, get_user_model
+
+    User = get_user_model()
+    username = (serializer.validated_data.get('username') or '').strip()
+    email = (serializer.validated_data.get('email') or '').strip()
+    password = serializer.validated_data['password']
+
+    user = None
+    if email and not username:
+        # Same email can exist on more than one row (imports / legacy data); never use get().
+        candidates = list(
+            User.objects.filter(email__iexact=email).order_by('date_joined', 'pk')
+        )
+        if not candidates:
+            return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+        if len(candidates) == 1:
+            username = candidates[0].username
+        else:
+            matched = []
+            for u in candidates:
+                authenticated = authenticate(request, username=u.username, password=password)
+                if authenticated is not None:
+                    matched.append(authenticated)
+            if not matched:
+                return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+            staff_matches = [u for u in matched if u.is_staff]
+            user = staff_matches[0] if staff_matches else matched[0]
+
+    if not username and user is None:
+        return Response({'error': 'username or email is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if user is None:
+        user = authenticate(request, username=username, password=password)
+    if user is None:
+        return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+    if not user.is_active:
+        return Response({'error': 'Account disabled'}, status=status.HTTP_403_FORBIDDEN)
+    if not user.is_staff:
+        return Response({'error': 'Admin access required'}, status=status.HTTP_403_FORBIDDEN)
+
+    login(request, user)
+    return Response({
+        'message': 'Login successful',
+        'user': _admin_user_payload(user),
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def admin_logout(request):
+    """POST /api/chatbot/admin/logout/ — clear Django session."""
+    from django.contrib.auth import logout
+
+    logout(request)
+    return Response({'message': 'Logged out'}, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_me(request):
+    """GET /api/chatbot/admin/me/ — current staff user (session)."""
+    return Response(_admin_user_payload(request.user), status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def admin_dashboard_data(request):
+    """
+    GET /api/chatbot/admin/dashboard/data/?limit=50
+    Consolidated data source for admin dashboard.
+    Returns overview metrics + latest pharmacies/pharmacists/requests/reservations.
+    """
+    limit = min(max(int(request.query_params.get('limit', 50)), 1), 200)
+    # Geocoding can be slow because it calls an external service per unique coordinate.
+    # Keep dashboard fast by default; frontend can opt-in with include_geocode=true.
+    include_geocode = request.query_params.get('include_geocode', 'false').lower() == 'true'
+
+    pharmacies_qs = Pharmacy.objects.annotate(
+        pharmacists_count=Count('pharmacists', distinct=True),
+        reservations_count=Count('reservations', distinct=True),
+        medicine_count=Count('inventory', distinct=True),
+        inventory_last_updated=Max('inventory__updated_at'),
+    ).order_by('-created_at')
+
+    pharmacists_qs = Pharmacist.objects.select_related('pharmacy').annotate(
+        responses_count=Count('responses', distinct=True),
+        declines_count=Count('declined_requests', distinct=True),
+    ).order_by('-created_at')
+
+    requests_qs = MedicineRequest.objects.select_related('conversation').annotate(
+        responses_count=Count('pharmacy_responses', distinct=True),
+        declines_count=Count('pharmacist_declines', distinct=True),
+    ).order_by('-created_at')
+
+    reservations_qs = Reservation.objects.select_related('pharmacy').order_by('-reserved_at')
+
+    pharmacies = []
+    for p in pharmacies_qs[:limit]:
+        last_sync = getattr(p, 'last_inventory_sync_at', None) or p.inventory_last_updated
+        pill = _pharmacy_registry_pill_status(p)
+        pharmacies.append({
+            'id': p.pharmacy_id,
+            'pharmacy_id': p.pharmacy_id,
+            'name': p.name,
+            'city': _city_from_address(p.address),
+            'address': p.address,
+            'pharmacy_type': getattr(p, 'pharmacy_type', '') or '',
+            'verification_status': getattr(p, 'verification_status', 'verified') or 'verified',
+            'status': pill,
+            'medicine_count': p.medicine_count,
+            'medicines_listed_count': p.medicine_count,
+            'inventory_count': p.medicine_count,
+            'last_sync_at': last_sync.isoformat() if last_sync else None,
+            'match_rate': float(p.response_rate) if p.response_rate is not None else None,
+            'phone': p.phone,
+            'email': p.email,
+            'is_active': p.is_active,
+            'rating': p.rating,
+            'rating_count': p.rating_count,
+            'response_rate': p.response_rate,
+            'pharmacists_count': p.pharmacists_count,
+            'reservations_count': p.reservations_count,
+            'created_at': p.created_at.isoformat() if p.created_at else None,
+        })
+
+    reg_total = Pharmacy.objects.count()
+    reg_verified = Pharmacy.objects.filter(
+        is_active=True, verification_status='verified',
+    ).count()
+    reg_pending = Pharmacy.objects.filter(
+        is_active=True, verification_status='pending_review',
+    ).count()
+    reg_suspended = Pharmacy.objects.filter(
+        Q(is_active=False) | Q(verification_status='suspended'),
+    ).count()
+    registry_summary = {
+        'total_registered': reg_total,
+        'verified': reg_verified,
+        'pending_review': reg_pending,
+        'suspended': reg_suspended,
+    }
+
+    pharmacists = [{
+        'pharmacist_id': str(ph.pharmacist_id),
+        'full_name': ph.full_name,
+        'first_name': ph.first_name,
+        'last_name': ph.last_name,
+        'email': ph.email,
+        'phone': ph.phone,
+        'license_number': ph.license_number,
+        'is_active': ph.is_active,
+        'pharmacy_id': ph.pharmacy.pharmacy_id if ph.pharmacy else None,
+        'pharmacy_name': ph.pharmacy.name if ph.pharmacy else None,
+        'responses_count': ph.responses_count,
+        'declines_count': ph.declines_count,
+        'created_at': ph.created_at.isoformat() if ph.created_at else None,
+    } for ph in pharmacists_qs[:limit]]
+
+    # Precompute short patient area label for admin list.
+    # Reverse geocoding is optional to avoid slow dashboard loads.
+    from .services import LocationService
+    _geo_cache = {}
+    requests_data = []
+    for req in requests_qs[:limit]:
+        raw_area = req.location_suburb or req.location_address or ''
+        # Many legacy rows store "Location: <lat>, <lon>" as address; prefer a real place name.
+        patient_area = raw_area
+        if include_geocode and (not patient_area or patient_area.startswith('Location:')) and req.location_latitude and req.location_longitude:
+            cache_key = f"{round(float(req.location_latitude), 4)},{round(float(req.location_longitude), 4)}"
+            if cache_key in _geo_cache:
+                patient_area = _geo_cache[cache_key]
+            else:
+                patient_area = LocationService.reverse_geocode(req.location_latitude, req.location_longitude, fallback=patient_area)
+                _geo_cache[cache_key] = patient_area
+        created_iso = req.created_at.isoformat() if req.created_at else None
+        requests_data.append({
+            'request_id': str(req.request_id),
+            'session_id': req.conversation.session_id if req.conversation else None,
+            'request_type': req.request_type,
+            'medicine_names': req.medicine_names or [],
+            'symptoms': req.symptoms or '',
+            'patient_area': patient_area,
+            'status': req.status,
+            'responses_count': req.responses_count,
+            'declines_count': req.declines_count,
+            'created_at': created_iso,
+            'submitted_at': created_iso,
+            'expires_at': req.expires_at.isoformat() if req.expires_at else None,
+        })
+
+    reservations = []
+    _res_cache = {}
+    for r in reservations_qs[:limit]:
+        patient_name, patient_location = _reservation_patient_name_and_location(r, _res_cache)
+        reservations.append({
+            'reservation_id': str(r.reservation_id),
+            'pharmacy_id': r.pharmacy.pharmacy_id if r.pharmacy else None,
+            'pharmacy_name': r.pharmacy.name if r.pharmacy else None,
+            'session_id': r.session_id,
+            'patient_name': patient_name,
+            'patient_phone': r.patient_phone or '',
+            'patient_location': patient_location,
+            'medicine_name': r.medicine_name,
+            'quantity': r.quantity,
+            'status': r.status,
+            'price_at_reservation': str(r.price_at_reservation) if r.price_at_reservation is not None else None,
+            'reserved_at': r.reserved_at.isoformat() if r.reserved_at else None,
+            'expires_at': r.expires_at.isoformat() if r.expires_at else None,
+        })
+
+    from django.contrib.auth import get_user_model
+    _User = get_user_model()
+    overview = {
+        'registered_pharmacies': Pharmacy.objects.count(),
+        'active_pharmacies': Pharmacy.objects.filter(is_active=True).count(),
+        'registered_pharmacists': Pharmacist.objects.count(),
+        'active_pharmacists': Pharmacist.objects.filter(is_active=True).count(),
+        'total_patient_requests': MedicineRequest.objects.count(),
+        'awaiting_responses_requests': MedicineRequest.objects.filter(status='awaiting_responses').count(),
+        'completed_requests': MedicineRequest.objects.filter(status='completed').count(),
+        'expired_or_timeout_requests': MedicineRequest.objects.filter(status__in=['expired', 'timeout']).count(),
+        'total_reservations': Reservation.objects.count(),
+        'active_reservations': Reservation.objects.filter(status__in=['pending', 'confirmed']).count(),
+        'picked_up_reservations': Reservation.objects.filter(status='picked_up').count(),
+        'expired_or_cancelled_reservations': Reservation.objects.filter(status__in=['expired', 'cancelled']).count(),
+        'total_pharmacy_responses': PharmacyResponse.objects.count(),
+        'total_declines': PharmacistDecline.objects.count(),
+        'total_patients': ChatConversation.objects.values('session_id').distinct().count(),
+        'total_users': _User.objects.count(),
+    }
+
+    reservations_by_status = dict(
+        Reservation.objects.values('status').annotate(total=Count('reservation_id')).values_list('status', 'total')
+    )
+    requests_by_status = dict(
+        MedicineRequest.objects.values('status').annotate(total=Count('request_id')).values_list('status', 'total')
+    )
+    top_pharmacies_by_reservations = list(
+        Pharmacy.objects.annotate(total_reservations=Count('reservations', distinct=True))
+        .filter(total_reservations__gt=0)
+        .order_by('-total_reservations', 'name')
+        .values('pharmacy_id', 'name', 'total_reservations')[:10]
+    )
+    top_pharmacists_by_responses = list(
+        Pharmacist.objects.annotate(total_responses=Count('responses', distinct=True))
+        .filter(total_responses__gt=0)
+        .order_by('-total_responses', 'last_name', 'first_name')
+        .values('pharmacist_id', 'first_name', 'last_name', 'email', 'total_responses')[:10]
+    )
+
+    return Response({
+        'overview': overview,
+        'registry': {
+            'summary': registry_summary,
+        },
+        'breakdown': {
+            'requests_by_status': requests_by_status,
+            'reservations_by_status': reservations_by_status,
+            'top_pharmacies_by_reservations': top_pharmacies_by_reservations,
+            'top_pharmacists_by_responses': top_pharmacists_by_responses,
+            'pharmacy_registry': registry_summary,
+        },
+        'lists': {
+            'pharmacies': pharmacies,
+            'pharmacists': pharmacists,
+            'patient_requests': requests_data,
+            'reservations': reservations,
+        },
+        'meta': {
+            'limit': limit,
+        },
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def admin_create_pharmacy(request):
+    """Create a pharmacy from admin dashboard."""
+    serializer = PharmacyRegistrationSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response({'error': 'Validation failed', 'details': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+    data = serializer.validated_data
+    if Pharmacy.objects.filter(pharmacy_id=data['pharmacy_id']).exists():
+        return Response({'error': 'pharmacy_id already exists'}, status=status.HTTP_400_BAD_REQUEST)
+
+    pharmacy = Pharmacy.objects.create(
+        pharmacy_id=data['pharmacy_id'],
+        name=data['name'],
+        address=data['address'],
+        latitude=data.get('latitude'),
+        longitude=data.get('longitude'),
+        phone=data.get('phone', ''),
+        email=data.get('email', ''),
+    )
+    _log_admin_action(request, 'pharmacy.create', 'pharmacy', pharmacy.pharmacy_id, {'name': pharmacy.name})
+    return Response(PharmacySerializer(pharmacy).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def admin_update_pharmacy(request, pharmacy_id):
+    """Edit pharmacy details from admin dashboard."""
+    pharmacy = get_object_or_404(Pharmacy, pharmacy_id=pharmacy_id)
+    allowed = {
+        'name', 'address', 'latitude', 'longitude', 'phone', 'email', 'is_active',
+        'pharmacy_type', 'verification_status', 'last_inventory_sync_at',
+    }
+    updates = {k: request.data[k] for k in allowed if k in request.data}
+    if not updates:
+        return Response({'error': 'No editable fields supplied'}, status=status.HTTP_400_BAD_REQUEST)
+
+    for key, value in list(updates.items()):
+        if key == 'last_inventory_sync_at' and value not in (None, ''):
+            if isinstance(value, str):
+                try:
+                    from django.utils.dateparse import parse_datetime
+                    dt = parse_datetime(value)
+                    if dt is None:
+                        return Response({'error': 'Invalid last_inventory_sync_at'}, status=status.HTTP_400_BAD_REQUEST)
+                    updates[key] = dt
+                except Exception:
+                    return Response({'error': 'Invalid last_inventory_sync_at'}, status=status.HTTP_400_BAD_REQUEST)
+        if key == 'verification_status' and value not in ('verified', 'pending_review', 'suspended', None, ''):
+            return Response({'error': 'Invalid verification_status'}, status=status.HTTP_400_BAD_REQUEST)
+
+    for key, value in updates.items():
+        setattr(pharmacy, key, value)
+    pharmacy.save(update_fields=list(updates.keys()) + ['updated_at'])
+    _log_admin_action(request, 'pharmacy.update', 'pharmacy', pharmacy_id, {'fields': list(updates.keys())})
+    return Response(PharmacySerializer(pharmacy).data, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def admin_create_pharmacist(request):
+    """Create pharmacist from admin dashboard."""
+    pharmacy_id = request.data.get('pharmacy_id')
+    if not pharmacy_id:
+        return Response({'error': 'pharmacy_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    pharmacy = get_object_or_404(Pharmacy, pharmacy_id=pharmacy_id)
+    required = ['first_name', 'last_name', 'email']
+    missing = [f for f in required if not request.data.get(f)]
+    if missing:
+        return Response({'error': f"Missing required fields: {', '.join(missing)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+    email = request.data.get('email', '').strip().lower()
+    if Pharmacist.objects.filter(email=email).exists():
+        return Response({'error': 'Pharmacist email already exists'}, status=status.HTTP_400_BAD_REQUEST)
+
+    pharmacist = Pharmacist.objects.create(
+        pharmacy=pharmacy,
+        first_name=request.data.get('first_name', '').strip(),
+        last_name=request.data.get('last_name', '').strip(),
+        email=email,
+        phone=request.data.get('phone', '').strip(),
+        license_number=request.data.get('license_number', '').strip(),
+        is_active=request.data.get('is_active', True),
+    )
+    return Response(PharmacistSerializer(pharmacist).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def admin_update_pharmacist(request, pharmacist_id):
+    """Edit pharmacist details from admin dashboard."""
+    pharmacist = get_object_or_404(Pharmacist, pharmacist_id=pharmacist_id)
+    allowed = {'first_name', 'last_name', 'email', 'phone', 'license_number', 'is_active', 'pharmacy_id'}
+    updates = {k: request.data[k] for k in allowed if k in request.data}
+    if not updates:
+        return Response({'error': 'No editable fields supplied'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if 'pharmacy_id' in updates:
+        pharmacist.pharmacy = get_object_or_404(Pharmacy, pharmacy_id=updates.pop('pharmacy_id'))
+
+    if 'email' in updates:
+        email = str(updates['email']).strip().lower()
+        if Pharmacist.objects.exclude(pk=pharmacist.pk).filter(email=email).exists():
+            return Response({'error': 'Pharmacist email already exists'}, status=status.HTTP_400_BAD_REQUEST)
+        updates['email'] = email
+
+    for key, value in updates.items():
+        setattr(pharmacist, key, value)
+    pharmacist.save()
+    return Response(PharmacistSerializer(pharmacist).data, status=status.HTTP_200_OK)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def admin_update_request_status(request, request_id):
+    """Update patient request status from admin dashboard."""
+    medicine_request = get_object_or_404(MedicineRequest, request_id=request_id)
+    new_status = request.data.get('status')
+    if not new_status:
+        return Response({'error': 'status is required'}, status=status.HTTP_400_BAD_REQUEST)
+    valid_statuses = {choice[0] for choice in MedicineRequest._meta.get_field('status').choices}
+    if new_status not in valid_statuses:
+        return Response({'error': f'Invalid status. Allowed: {sorted(valid_statuses)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+    medicine_request.status = new_status
+    medicine_request.save(update_fields=['status'])
+    _log_admin_action(request, 'request.status', 'medicine_request', str(request_id), {'status': new_status})
+    return Response({
+        'request_id': str(medicine_request.request_id),
+        'status': medicine_request.status,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def admin_update_reservation_status(request, reservation_id):
+    """Update reservation status from admin dashboard."""
+    reservation = get_object_or_404(Reservation, reservation_id=reservation_id)
+    new_status = request.data.get('status')
+    if not new_status:
+        return Response({'error': 'status is required'}, status=status.HTTP_400_BAD_REQUEST)
+    valid_statuses = {choice[0] for choice in Reservation._meta.get_field('status').choices}
+    if new_status not in valid_statuses:
+        return Response({'error': f'Invalid status. Allowed: {sorted(valid_statuses)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+    reservation.status = new_status
+    reservation.save(update_fields=['status'])
+    return Response({
+        'reservation_id': str(reservation.reservation_id),
+        'status': reservation.status,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAdminUser])
+def admin_delete_pharmacist(request, pharmacist_id):
+    """Delete pharmacist from admin dashboard."""
+    pharmacist = get_object_or_404(Pharmacist, pharmacist_id=pharmacist_id)
+
+    if pharmacist.responses.exists() or pharmacist.declined_requests.exists():
+        return Response({
+            'error': 'Cannot delete pharmacist with request history. Set is_active=false instead.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    pharmacist.delete()
+    return Response({'deleted': True, 'pharmacist_id': str(pharmacist_id)}, status=status.HTTP_200_OK)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAdminUser])
+def admin_delete_pharmacy(request, pharmacy_id):
+    """Delete pharmacy from admin dashboard."""
+    pharmacy = get_object_or_404(Pharmacy, pharmacy_id=pharmacy_id)
+
+    has_pharmacists = pharmacy.pharmacists.exists()
+    has_reservations = pharmacy.reservations.exists()
+    has_responses = pharmacy.responses.exists()
+    has_inventory = pharmacy.inventory.exists()
+    has_ratings = pharmacy.ratings.exists()
+
+    if has_pharmacists or has_reservations or has_responses or has_inventory or has_ratings:
+        return Response({
+            'error': (
+                'Cannot delete pharmacy with linked records '
+                '(pharmacists/reservations/responses/inventory/ratings). '
+                'Set is_active=false instead.'
+            )
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    pharmacy.delete()
+    _log_admin_action(request, 'pharmacy.delete', 'pharmacy', pharmacy_id)
+    return Response({'deleted': True, 'pharmacy_id': pharmacy_id}, status=status.HTTP_200_OK)
+
+
 # ---------- Patient dashboard (MediConnect) ----------
 
 def _patient_session_from_request(request):
@@ -3245,6 +4221,9 @@ def patient_request_detail(request, request_id):
     if medicine_request.conversation.session_id != session_id:
         return Response({'error': 'Not your request'}, status=status.HTTP_403_FORBIDDEN)
     ranked = get_ranked_pharmacy_responses(medicine_request, limit=10)
+    persist_medicine_request_ranking_snapshot(
+        medicine_request, ranked, 'patient_portal', limit_applied=10,
+    )
     return Response({
         'request_id': str(medicine_request.request_id),
         'short_request_id': str(medicine_request.request_id).replace('-', '')[:8].upper(),
@@ -3254,6 +4233,174 @@ def patient_request_detail(request, request_id):
         'status': medicine_request.status,
         'submitted_at': medicine_request.created_at.isoformat() if medicine_request.created_at else None,
         'pharmacy_responses': ranked,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_request_detail(request, request_id):
+    """
+    GET /api/chatbot/admin/requests/<request_id>/
+    Full admin view of a patient medicine request:
+    - What the patient requested (medicines, symptoms, location, timestamps).
+    - What was broadcast and which pharmacies responded (ranked responses).
+    - What the patient did after broadcast (reservations, ratings, notifications).
+    """
+    medicine_request = get_object_or_404(MedicineRequest.objects.select_related('conversation'), request_id=request_id)
+    conversation = medicine_request.conversation
+    session_id = conversation.session_id if conversation else None
+
+    # Ranked pharmacy responses for this exact request.
+    ranked = get_ranked_pharmacy_responses(medicine_request, limit=20)
+
+    # If no direct responses exist yet, provide related ranked responses from
+    # other requests in the same conversation/session so admin can still see
+    # what happened after broadcast in this patient journey.
+    related_ranked = []
+    if not ranked:
+        related_qs = MedicineRequest.objects.exclude(request_id=medicine_request.request_id)
+        if conversation:
+            related_qs = related_qs.filter(conversation=conversation)
+        elif session_id:
+            related_qs = related_qs.filter(conversation__session_id=session_id)
+        else:
+            related_qs = MedicineRequest.objects.none()
+        related_qs = related_qs.order_by('-created_at')[:10]
+        for rel_req in related_qs:
+            rel_ranked = get_ranked_pharmacy_responses(rel_req, limit=10)
+            if rel_ranked:
+                related_ranked.append({
+                    'request_id': str(rel_req.request_id),
+                    'created_at': rel_req.created_at.isoformat() if rel_req.created_at else None,
+                    'status': rel_req.status,
+                    'medicine_names': rel_req.medicine_names or [],
+                    'symptoms': rel_req.symptoms or '',
+                    'responses': rel_ranked,
+                })
+
+    # Reservations linked to this conversation/session (patient follow-up)
+    reservations_qs = Reservation.objects.all()
+    if conversation:
+        reservations_qs = reservations_qs.filter(conversation=conversation)
+    elif session_id:
+        reservations_qs = reservations_qs.filter(session_id=session_id)
+    else:
+        reservations_qs = Reservation.objects.none()
+    reservations_qs = reservations_qs.select_related('pharmacy').order_by('-reserved_at')
+    reservations = []
+    _res_cache = {}
+    for r in reservations_qs:
+        patient_name, patient_location = _reservation_patient_name_and_location(r, _res_cache)
+        reservations.append({
+            'reservation_id': str(r.reservation_id),
+            'pharmacy_id': r.pharmacy.pharmacy_id if r.pharmacy else None,
+            'pharmacy_name': r.pharmacy.name if r.pharmacy else None,
+            'medicine_name': r.medicine_name,
+            'quantity': r.quantity,
+            'status': r.status,
+            'price_at_reservation': str(r.price_at_reservation) if r.price_at_reservation is not None else None,
+            'patient_name': patient_name,
+            'patient_phone': r.patient_phone or '',
+            'patient_location': patient_location,
+            'reserved_at': r.reserved_at.isoformat() if r.reserved_at else None,
+            'expires_at': r.expires_at.isoformat() if r.expires_at else None,
+            'confirmed_at': r.confirmed_at.isoformat() if r.confirmed_at else None,
+            'picked_up_at': r.picked_up_at.isoformat() if r.picked_up_at else None,
+            'cancelled_at': r.cancelled_at.isoformat() if r.cancelled_at else None,
+        })
+
+    # Ratings linked to this request (or related requests in same journey if direct is empty)
+    rating_requests = [medicine_request]
+    if related_ranked:
+        related_ids = [item['request_id'] for item in related_ranked]
+        rating_requests = list(MedicineRequest.objects.filter(request_id__in=related_ids)) + [medicine_request]
+    ratings_qs = PharmacyRating.objects.filter(response__request__in=rating_requests).select_related('pharmacy', 'response')
+    ratings = [{
+        'pharmacy_id': pr.pharmacy.pharmacy_id if pr.pharmacy else None,
+        'pharmacy_name': pr.pharmacy.name if pr.pharmacy else None,
+        'response_id': str(pr.response.response_id) if pr.response else None,
+        'rating': pr.rating,
+        'notes': pr.notes,
+        'created_at': pr.created_at.isoformat() if pr.created_at else None,
+    } for pr in ratings_qs]
+
+    # Notifications related to this request/patient journey (what the patient saw)
+    notifications_qs = PatientNotification.objects.none()
+    if session_id:
+        notifications_qs = PatientNotification.objects.filter(session_id=session_id)
+    else:
+        notifications_qs = PatientNotification.objects.filter(related_request_id=medicine_request.request_id)
+    notifications_qs = notifications_qs.order_by('-created_at')[:100]
+    notifications = [{
+        'id': n.id,
+        'notification_type': n.notification_type,
+        'title': n.title,
+        'body': n.body,
+        'related_response_id': str(n.related_response_id) if n.related_response_id else None,
+        'read': n.read_at is not None,
+        'read_at': n.read_at.isoformat() if n.read_at else None,
+        'created_at': n.created_at.isoformat() if n.created_at else None,
+    } for n in notifications_qs]
+
+    # Human-readable patient area for admin detail
+    from .services import LocationService
+    raw_area = medicine_request.location_suburb or medicine_request.location_address or ''
+    patient_area = raw_area
+    if (not patient_area or patient_area.startswith('Location:')) and medicine_request.location_latitude and medicine_request.location_longitude:
+        patient_area = LocationService.reverse_geocode(
+            medicine_request.location_latitude,
+            medicine_request.location_longitude,
+            fallback=patient_area,
+        )
+
+    short_id = str(medicine_request.request_id).replace('-', '')[:8].upper()
+    request_payload = {
+        'request_id': str(medicine_request.request_id),
+        'short_request_id': short_id,
+        'session_id': session_id,
+        'conversation_id': str(conversation.conversation_id) if conversation else None,
+        'request_type': medicine_request.request_type,
+        'medicine_names': medicine_request.medicine_names or [],
+        'symptoms': medicine_request.symptoms or '',
+        'location_latitude': medicine_request.location_latitude,
+        'location_longitude': medicine_request.location_longitude,
+        'location_address': medicine_request.location_address or '',
+        'location_suburb': medicine_request.location_suburb or '',
+        'patient_area': patient_area,
+        'status': medicine_request.status,
+        'created_at': medicine_request.created_at.isoformat() if medicine_request.created_at else None,
+        'expires_at': medicine_request.expires_at.isoformat() if medicine_request.expires_at else None,
+    }
+
+    snap_qs = medicine_request.ranking_snapshots.all().order_by('-created_at')[:40]
+    ranking_snapshot_history = [{
+        'snapshot_id': str(s.snapshot_id),
+        'created_at': s.created_at.isoformat() if s.created_at else None,
+        'source': s.source,
+        'limit_applied': s.limit_applied,
+        'ranked_responses': s.ranked_items,
+    } for s in snap_qs]
+    ranking_snapshots_total = medicine_request.ranking_snapshots.count()
+
+    # Simple summary of follow-up actions for quick admin glance
+    summary = {
+        'responses_count': len(ranked),
+        'related_requests_with_responses': len(related_ranked),
+        'reservations_count': len(reservations),
+        'ratings_count': len(ratings),
+        'notifications_count': len(notifications),
+        'ranking_snapshots_stored': ranking_snapshots_total,
+    }
+
+    return Response({
+        'request': request_payload,
+        'pharmacy_responses': ranked,
+        'ranking_snapshot_history': ranking_snapshot_history,
+        'related_ranked_responses': related_ranked,
+        'reservations': reservations,
+        'ratings': ratings,
+        'notifications': notifications,
+        'summary': summary,
     }, status=status.HTTP_200_OK)
 
 
@@ -3312,6 +4459,612 @@ def patient_saved_medicine_remove(request, medicine_name=None):
         return Response({'error': 'medicine_name is required'}, status=status.HTTP_400_BAD_REQUEST)
     deleted, _ = SavedMedicine.objects.filter(session_id=session_id, medicine_name=name.lower()).delete()
     return Response({'removed': deleted > 0}, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_patient_overview(request, session_id):
+    """
+    GET /api/chatbot/admin/patients/<session_id>/overview/
+    Admin view of a patient's dashboard data (read-only):
+    - Profile
+    - Dashboard stats
+    - Recent requests
+    - Saved medicines
+    - Notifications
+    """
+    # Profile (may not exist yet)
+    profile = PatientProfile.objects.filter(session_id=session_id).first()
+    profile_data = None
+    if profile:
+        profile_data = {
+            'session_id': profile.session_id,
+            'display_name': profile.display_name,
+            'email': profile.email,
+            'phone': profile.phone,
+            'home_area': profile.home_area,
+            'preferred_language': profile.preferred_language,
+            'created_at': profile.created_at.isoformat() if profile.created_at else None,
+            'updated_at': profile.updated_at.isoformat() if profile.updated_at else None,
+        }
+
+    # Conversations and requests for this session
+    conversations = ChatConversation.objects.filter(session_id=session_id).values_list('pk', flat=True)
+    requests_qs = MedicineRequest.objects.filter(conversation_id__in=conversations).order_by('-created_at')
+
+    # Stats (same as patient_dashboard_stats, but admin-only)
+    active_statuses = ('broadcasting', 'awaiting_responses', 'responses_received', 'ranking', 'partial')
+    stats = {
+        'active_requests': requests_qs.filter(status__in=active_statuses).count(),
+        'fulfilled_count': requests_qs.filter(status='completed').count(),
+        'expired_count': requests_qs.filter(status__in=('expired', 'timeout')).count(),
+    }
+
+    # Recent requests list
+    req_results = []
+    from django.db.models import Min
+    for req in requests_qs.select_related('conversation').prefetch_related('pharmacy_responses')[:50]:
+        responses = req.pharmacy_responses.all()
+        resp_count = responses.count()
+        best_price = None
+        best_pharmacy_name = None
+        if resp_count:
+            with_price = responses.filter(price__isnull=False).order_by('price').first()
+            if with_price:
+                best_price = str(with_price.price)
+                best_pharmacy_name = with_price.pharmacy.name if with_price.pharmacy else with_price.pharmacy_name
+        short_id = str(req.request_id).replace('-', '')[:8].upper()
+        req_results.append({
+            'request_id': str(req.request_id),
+            'short_request_id': short_id,
+            'request_type': req.request_type,
+            'medicine_names': req.medicine_names or [],
+            'symptoms': req.symptoms or '',
+            'location_address': req.location_address or req.location_suburb or '',
+            'submitted_at': req.created_at.isoformat() if req.created_at else None,
+            'status': req.status,
+            'response_count': resp_count,
+            'best_price': best_price,
+            'best_pharmacy_name': best_pharmacy_name,
+        })
+
+    # Saved medicines
+    saved_qs = SavedMedicine.objects.filter(session_id=session_id).order_by('-created_at')
+    saved = [{
+        'id': s.id,
+        'medicine_name': s.medicine_name,
+        'display_name': s.display_name or s.medicine_name,
+        'last_searched_at': s.last_searched_at.isoformat() if s.last_searched_at else None,
+        'created_at': s.created_at.isoformat() if s.created_at else None,
+    } for s in saved_qs]
+
+    # Notifications
+    notifs_qs = PatientNotification.objects.filter(session_id=session_id).order_by('-created_at')[:100]
+    notifications = [{
+        'id': n.id,
+        'notification_type': n.notification_type,
+        'title': n.title,
+        'body': n.body,
+        'related_request_id': str(n.related_request_id) if n.related_request_id else None,
+        'related_response_id': str(n.related_response_id) if n.related_response_id else None,
+        'read': n.read_at is not None,
+        'read_at': n.read_at.isoformat() if n.read_at else None,
+        'created_at': n.created_at.isoformat() if n.created_at else None,
+    } for n in notifs_qs]
+
+    return Response({
+        'session_id': session_id,
+        'profile': profile_data,
+        'stats': stats,
+        'requests': req_results,
+        'saved_medicines': saved,
+        'notifications': notifications,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def admin_update_patient_profile(request, session_id):
+    """
+    PATCH /api/chatbot/admin/patients/<session_id>/profile/
+    Create or update a PatientProfile for this session.
+    """
+    profile, _created = PatientProfile.objects.get_or_create(session_id=session_id)
+    allowed = {
+        'display_name',
+        'email',
+        'phone',
+        'home_area',
+        'preferred_language',
+    }
+    updates = {k: request.data[k] for k in allowed if k in request.data}
+    if not updates:
+        return Response({'error': 'No editable fields supplied'}, status=status.HTTP_400_BAD_REQUEST)
+    for key, value in updates.items():
+        setattr(profile, key, value)
+    profile.save()
+    return Response({
+        'session_id': profile.session_id,
+        'display_name': profile.display_name,
+        'email': profile.email,
+        'phone': profile.phone,
+        'home_area': profile.home_area,
+        'preferred_language': profile.preferred_language,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_patient_saved_medicines(request, session_id):
+    """
+    GET /api/chatbot/admin/patients/<session_id>/saved-medicines/
+    Admin view of patient's saved medicines.
+    """
+    saved_qs = SavedMedicine.objects.filter(session_id=session_id).order_by('-created_at')
+    results = [{
+        'id': s.id,
+        'medicine_name': s.medicine_name,
+        'display_name': s.display_name or s.medicine_name,
+        'last_searched_at': s.last_searched_at.isoformat() if s.last_searched_at else None,
+        'created_at': s.created_at.isoformat() if s.created_at else None,
+    } for s in saved_qs]
+    return Response(results, status=status.HTTP_200_OK)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAdminUser])
+def admin_clear_patient_saved_medicines(request, session_id):
+    """
+    DELETE /api/chatbot/admin/patients/<session_id>/saved-medicines/clear/
+    Remove all saved medicines for this session.
+    """
+    deleted, _ = SavedMedicine.objects.filter(session_id=session_id).delete()
+    return Response({'cleared': deleted}, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_patient_notifications(request, session_id):
+    """
+    GET /api/chatbot/admin/patients/<session_id>/notifications/
+    Admin view of patient's notifications.
+    """
+    qs = PatientNotification.objects.filter(session_id=session_id).order_by('-created_at')[:200]
+    results = [{
+        'id': n.id,
+        'notification_type': n.notification_type,
+        'title': n.title,
+        'body': n.body,
+        'related_request_id': str(n.related_request_id) if n.related_request_id else None,
+        'related_response_id': str(n.related_response_id) if n.related_response_id else None,
+        'read': n.read_at is not None,
+        'read_at': n.read_at.isoformat() if n.read_at else None,
+        'created_at': n.created_at.isoformat() if n.created_at else None,
+    } for n in qs]
+    return Response(results, status=status.HTTP_200_OK)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAdminUser])
+def admin_clear_patient_notifications(request, session_id):
+    """
+    DELETE /api/chatbot/admin/patients/<session_id>/notifications/clear/
+    Remove all notifications for this session.
+    """
+    deleted, _ = PatientNotification.objects.filter(session_id=session_id).delete()
+    return Response({'cleared': deleted}, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_control_center(request):
+    """
+    GET /api/chatbot/admin/control/center/
+    Operational control view for admins:
+    - stuck/no-response requests
+    - expiring reservations
+    - low-rated pharmacies
+    - summary counts
+    Query params:
+      - no_response_minutes (default 10)
+      - expiring_minutes (default 30)
+      - limit (default 50, max 200)
+    """
+    now = timezone.now()
+    no_response_minutes = min(max(int(request.query_params.get('no_response_minutes', 10)), 1), 240)
+    expiring_minutes = min(max(int(request.query_params.get('expiring_minutes', 30)), 1), 240)
+    limit = min(max(int(request.query_params.get('limit', 50)), 1), 200)
+
+    active_statuses = ('broadcasting', 'awaiting_responses', 'responses_received', 'ranking', 'partial')
+    no_response_cutoff = now - timedelta(minutes=no_response_minutes)
+    expiring_cutoff = now + timedelta(minutes=expiring_minutes)
+
+    requests_qs = MedicineRequest.objects.select_related('conversation').annotate(
+        responses_count=Count('pharmacy_responses', distinct=True),
+        declines_count=Count('pharmacist_declines', distinct=True),
+    )
+
+    # Requests that are active but still have no pharmacy response.
+    no_response_requests_qs = requests_qs.filter(
+        status__in=active_statuses,
+        created_at__lte=no_response_cutoff,
+        responses_count=0,
+    ).order_by('-created_at')[:limit]
+
+    no_response_requests = [{
+        'request_id': str(r.request_id),
+        'session_id': r.conversation.session_id if r.conversation else None,
+        'request_type': r.request_type,
+        'medicine_names': r.medicine_names or [],
+        'symptoms': r.symptoms or '',
+        'status': r.status,
+        'responses_count': r.responses_count,
+        'declines_count': r.declines_count,
+        'created_at': r.created_at.isoformat() if r.created_at else None,
+        'submitted_at': r.created_at.isoformat() if r.created_at else None,
+        'expires_at': r.expires_at.isoformat() if r.expires_at else None,
+    } for r in no_response_requests_qs]
+
+    # Reservations that are still active and expiring soon.
+    expiring_reservations_qs = Reservation.objects.select_related('pharmacy', 'conversation').filter(
+        status__in=['pending', 'confirmed'],
+        expires_at__gt=now,
+        expires_at__lte=expiring_cutoff,
+    ).order_by('expires_at')[:limit]
+
+    _res_cache = {}
+    expiring_reservations = []
+    for r in expiring_reservations_qs:
+        patient_name, patient_location = _reservation_patient_name_and_location(r, _res_cache)
+        expiring_reservations.append({
+            'reservation_id': str(r.reservation_id),
+            'pharmacy_id': r.pharmacy.pharmacy_id if r.pharmacy else None,
+            'pharmacy_name': r.pharmacy.name if r.pharmacy else None,
+            'medicine_name': r.medicine_name,
+            'quantity': r.quantity,
+            'status': r.status,
+            'patient_name': patient_name,
+            'patient_phone': r.patient_phone or '',
+            'patient_location': patient_location,
+            'reserved_at': r.reserved_at.isoformat() if r.reserved_at else None,
+            'expires_at': r.expires_at.isoformat() if r.expires_at else None,
+        })
+
+    # Pharmacies likely needing intervention.
+    low_rated_pharmacies_qs = Pharmacy.objects.annotate(
+        pharmacists_count=Count('pharmacists', distinct=True),
+        reservations_count=Count('reservations', distinct=True),
+    ).filter(
+        rating_count__gte=3,
+        rating__lt=3.0,
+    ).order_by('rating', '-rating_count', 'name')[:limit]
+
+    low_rated_pharmacies = [{
+        'pharmacy_id': p.pharmacy_id,
+        'name': p.name,
+        'address': p.address,
+        'phone': p.phone,
+        'email': p.email,
+        'is_active': p.is_active,
+        'rating': p.rating,
+        'rating_count': p.rating_count,
+        'response_rate': p.response_rate,
+        'pharmacists_count': p.pharmacists_count,
+        'reservations_count': p.reservations_count,
+    } for p in low_rated_pharmacies_qs]
+
+    summary = {
+        'total_active_requests': requests_qs.filter(status__in=active_statuses).count(),
+        'no_response_requests': len(no_response_requests),
+        'expiring_reservations': len(expiring_reservations),
+        'low_rated_pharmacies': len(low_rated_pharmacies),
+    }
+
+    return Response({
+        'summary': summary,
+        'queues': {
+            'no_response_requests': no_response_requests,
+            'expiring_reservations': expiring_reservations,
+            'low_rated_pharmacies': low_rated_pharmacies,
+        },
+        'meta': {
+            'no_response_minutes': no_response_minutes,
+            'expiring_minutes': expiring_minutes,
+            'generated_at': now.isoformat(),
+            'limit': limit,
+        }
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_export_pharmacies_csv(request):
+    """
+    GET /api/chatbot/admin/pharmacies/export/
+    CSV export for pharmacy registry table (same columns UI expects).
+    """
+    qs = Pharmacy.objects.annotate(
+        medicine_count=Count('inventory', distinct=True),
+        inventory_last_updated=Max('inventory__updated_at'),
+    ).order_by('name')
+    response = HttpResponse(content_type='text/csv; charset=utf-8')
+    response['Content-Disposition'] = 'attachment; filename="pharmacies_registry.csv"'
+    writer = csv.writer(response)
+    writer.writerow([
+        'id', 'name', 'city', 'pharmacy_type', 'verification_status', 'status_pill',
+        'medicine_count', 'last_sync_at', 'match_rate', 'is_active',
+        'address', 'phone', 'email',
+    ])
+    for p in qs:
+        last_sync = getattr(p, 'last_inventory_sync_at', None) or p.inventory_last_updated
+        writer.writerow([
+            p.pharmacy_id,
+            p.name,
+            _city_from_address(p.address),
+            getattr(p, 'pharmacy_type', '') or '',
+            getattr(p, 'verification_status', 'verified') or 'verified',
+            _pharmacy_registry_pill_status(p),
+            p.medicine_count,
+            last_sync.isoformat() if last_sync else '',
+            p.response_rate if p.response_rate is not None else '',
+            p.is_active,
+            p.address,
+            p.phone,
+            p.email,
+        ])
+    return response
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_search_analytics(request):
+    """
+    GET /api/chatbot/admin/analytics/search-volume/?days=30
+    Search/request volume trends and rough aggregates (server-side).
+    """
+    days = min(max(int(request.query_params.get('days', 30)), 1), 366)
+    start = timezone.now() - timedelta(days=days)
+    qs = MedicineRequest.objects.filter(created_at__gte=start)
+    by_day = list(
+        qs.annotate(day=TruncDate('created_at'))
+        .values('day')
+        .annotate(count=Count('request_id'))
+        .order_by('day')
+    )
+    by_day_out = [{
+        'date': row['day'].isoformat() if row['day'] else None,
+        'count': row['count'],
+    } for row in by_day]
+
+    medicine_counter = Counter()
+    region_counter = Counter()
+    for r in qs.only('medicine_names', 'location_suburb', 'location_address'):
+        for m in (r.medicine_names or []):
+            if m:
+                medicine_counter[str(m).strip().lower()] += 1
+        reg = (r.location_suburb or '').strip()
+        if not reg and r.location_address:
+            reg = _city_from_address(r.location_address) or str(r.location_address)[:80]
+        region_counter[reg or 'unknown'] += 1
+
+    annotated = qs.annotate(rc=Count('pharmacy_responses', distinct=True))
+    zero_result = annotated.filter(rc=0).count()
+    total = qs.count()
+    zero_rate = round(zero_result / total, 6) if total else 0.0
+
+    return Response({
+        'days': days,
+        'requests_by_day': by_day_out,
+        'top_medicines': [{'medicine': k, 'count': v} for k, v in medicine_counter.most_common(40)],
+        'top_regions': [{'region': k, 'count': v} for k, v in region_counter.most_common(40)],
+        'zero_result_requests': zero_result,
+        'zero_result_rate': zero_rate,
+        'total_requests_in_window': total,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_users_list(request):
+    """
+    GET /api/chatbot/admin/users/?page=1&page_size=50&search=
+    Paginated Django users (staff can audit platform accounts).
+    """
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    page = max(int(request.query_params.get('page', 1)), 1)
+    page_size = min(max(int(request.query_params.get('page_size', 50)), 1), 200)
+    search = (request.query_params.get('search') or '').strip()
+    qs = User.objects.all().order_by('-date_joined')
+    if search:
+        qs = qs.filter(
+            Q(username__icontains=search)
+            | Q(email__icontains=search)
+            | Q(first_name__icontains=search)
+            | Q(last_name__icontains=search)
+        )
+    total = qs.count()
+    offset = (page - 1) * page_size
+    users = [{
+        'id': str(u.pk),
+        'username': u.username,
+        'email': u.email or '',
+        'first_name': u.first_name or '',
+        'last_name': u.last_name or '',
+        'is_staff': u.is_staff,
+        'is_superuser': u.is_superuser,
+        'is_active': u.is_active,
+        'date_joined': u.date_joined.isoformat() if u.date_joined else None,
+        'last_login': u.last_login.isoformat() if u.last_login else None,
+    } for u in qs[offset:offset + page_size]]
+    return Response({
+        'total': total,
+        'page': page,
+        'page_size': page_size,
+        'users': users,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_patients_list(request):
+    """
+    GET /api/chatbot/admin/patients-list/?page=1&page_size=50&search=
+    Anonymous + profiled patients keyed by session_id (from chat conversations).
+    Use admin/patients/<session_id>/overview/ for full detail.
+    Note: path cannot be /admin/patients/ without conflicting with …/overview/;
+    this lives at /admin/patients-list/ (see urls).
+    """
+    page = max(int(request.query_params.get('page', 1)), 1)
+    page_size = min(max(int(request.query_params.get('page_size', 50)), 1), 200)
+    search = (request.query_params.get('search') or '').strip()
+
+    session_qs = (
+        ChatConversation.objects.values('session_id')
+        .annotate(
+            last_active=Max('updated_at'),
+            conversation_count=Count('conversation_id'),
+        )
+        .order_by('-last_active')
+    )
+    if search:
+        session_qs = session_qs.filter(session_id__icontains=search)
+
+    total = session_qs.count()
+    offset = (page - 1) * page_size
+    page_rows = list(session_qs[offset:offset + page_size])
+
+    profile_map = {}
+    if page_rows:
+        sids = [r['session_id'] for r in page_rows]
+        for prof in PatientProfile.objects.filter(session_id__in=sids):
+            profile_map[prof.session_id] = prof
+
+    patients = []
+    for row in page_rows:
+        sid = row['session_id']
+        prof = profile_map.get(sid)
+        patients.append({
+            'session_id': sid,
+            'last_active': row['last_active'].isoformat() if row['last_active'] else None,
+            'conversation_count': row['conversation_count'],
+            'profile': None if not prof else {
+                'display_name': prof.display_name or '',
+                'email': prof.email or '',
+                'phone': prof.phone or '',
+                'home_area': prof.home_area or '',
+                'updated_at': prof.updated_at.isoformat() if prof.updated_at else None,
+            },
+        })
+
+    return Response({
+        'total': total,
+        'page': page,
+        'page_size': page_size,
+        'patients': patients,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_chatbot_logs(request):
+    """
+    GET /api/chatbot/admin/chatbot/logs/?page=1&page_size=30&search=&session_id=
+    Recent AI chat conversations (metadata only; use …/logs/<conversation_id>/ for messages).
+    """
+    page = max(int(request.query_params.get('page', 1)), 1)
+    page_size = min(max(int(request.query_params.get('page_size', 30)), 1), 100)
+    search = (request.query_params.get('search') or '').strip()
+    session_filter = (request.query_params.get('session_id') or '').strip()
+
+    qs = ChatConversation.objects.annotate(message_count=Count('messages', distinct=True)).order_by('-updated_at')
+    if session_filter:
+        qs = qs.filter(session_id=session_filter)
+    if search:
+        qs = qs.filter(Q(session_id__icontains=search) | Q(conversation_id__icontains=search))
+
+    total = qs.count()
+    offset = (page - 1) * page_size
+    conversations = []
+    for conv in qs[offset:offset + page_size]:
+        last_msg = ChatMessage.objects.filter(conversation=conv).order_by('-created_at').values_list('content', 'role').first()
+        preview = ''
+        if last_msg:
+            preview = (last_msg[0] or '')[:200]
+        conversations.append({
+            'conversation_id': str(conv.conversation_id),
+            'session_id': conv.session_id,
+            'status': conv.status,
+            'message_count': conv.message_count,
+            'created_at': conv.created_at.isoformat() if conv.created_at else None,
+            'updated_at': conv.updated_at.isoformat() if conv.updated_at else None,
+            'last_message_preview': preview,
+            'last_message_role': last_msg[1] if last_msg else None,
+        })
+    return Response({
+        'total': total,
+        'page': page,
+        'page_size': page_size,
+        'conversations': conversations,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_chatbot_conversation_logs(request, conversation_id):
+    """
+    GET /api/chatbot/admin/chatbot/logs/<conversation_id>/
+    Full AI chat transcript for one conversation (user/assistant/system + metadata).
+    """
+    conv = get_object_or_404(ChatConversation, conversation_id=conversation_id)
+    msgs = ChatMessage.objects.filter(conversation=conv).order_by('created_at')
+    return Response({
+        'conversation_id': str(conv.conversation_id),
+        'session_id': conv.session_id,
+        'status': conv.status,
+        'context_metadata': conv.context_metadata or {},
+        'created_at': conv.created_at.isoformat() if conv.created_at else None,
+        'updated_at': conv.updated_at.isoformat() if conv.updated_at else None,
+        'messages': [{
+            'message_id': str(m.message_id),
+            'role': m.role,
+            'content': m.content,
+            'metadata': m.metadata or {},
+            'created_at': m.created_at.isoformat() if m.created_at else None,
+        } for m in msgs],
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_audit_logs(request):
+    """
+    GET /api/chatbot/admin/audit/logs/?page=1&page_size=50
+    Paged admin action audit trail.
+    """
+    page = max(int(request.query_params.get('page', 1)), 1)
+    page_size = min(max(int(request.query_params.get('page_size', 50)), 1), 200)
+    offset = (page - 1) * page_size
+    qs = AdminAuditLog.objects.all().order_by('-created_at')
+    total = qs.count()
+    rows = qs[offset:offset + page_size]
+    return Response({
+        'total': total,
+        'page': page,
+        'page_size': page_size,
+        'results': [{
+            'id': log.pk,
+            'username': log.username,
+            'action': log.action,
+            'target_type': log.target_type,
+            'target_id': log.target_id,
+            'success': log.success,
+            'detail': log.detail,
+            'ip_address': str(log.ip_address) if log.ip_address else None,
+            'created_at': log.created_at.isoformat() if log.created_at else None,
+        } for log in rows],
+    }, status=status.HTTP_200_OK)
 
 
 @api_view(['GET'])

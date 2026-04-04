@@ -35,7 +35,10 @@ class PharmacySerializer(serializers.ModelSerializer):
         model = Pharmacy
         fields = [
             'pharmacy_id', 'name', 'address', 'latitude', 'longitude',
-            'phone', 'email', 'is_active', 'created_at'
+            'phone', 'email', 'is_active',
+            'rating', 'rating_count', 'response_rate',
+            'pharmacy_type', 'verification_status', 'last_inventory_sync_at',
+            'created_at', 'updated_at',
         ]
 
 
@@ -152,3 +155,15 @@ class PharmacistLoginSerializer(serializers.Serializer):
     """Serializer for pharmacist login"""
     email = serializers.EmailField(required=True)
     password = serializers.CharField(required=True, write_only=True)
+
+
+class AdminLoginSerializer(serializers.Serializer):
+    """Staff/superuser login for SPA admin dashboard (Django session)."""
+    username = serializers.CharField(required=False, allow_blank=True)
+    email = serializers.EmailField(required=False, allow_blank=True)
+    password = serializers.CharField(required=True, write_only=True)
+
+    def validate(self, attrs):
+        if not (attrs.get('username') or '').strip() and not (attrs.get('email') or '').strip():
+            raise serializers.ValidationError('Provide username or email.')
+        return attrs

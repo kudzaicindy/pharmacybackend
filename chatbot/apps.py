@@ -1,16 +1,18 @@
 from django.apps import AppConfig
 import os
+from django.conf import settings
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
 class ChatbotConfig(AppConfig):
-    default_auto_field = 'django.db.models.BigAutoField'
     name = 'chatbot'
-    
+
     def ready(self):
-        """Initialize MongoDB connection when app is ready"""
+        """Optional mongoengine connection when Django is not using MongoDB as its default DB."""
+        if settings.DATABASES['default'].get('ENGINE') == 'django_mongodb_backend':
+            return
         try:
             import mongoengine
             mongodb_uri = os.getenv('MONGODB_URI')
@@ -19,7 +21,7 @@ class ChatbotConfig(AppConfig):
                     host=mongodb_uri,
                     alias='default'
                 )
-                print("[OK] MongoDB connected via mongoengine")
+                print('[OK] MongoDB connected via mongoengine')
         except Exception as e:
-            print(f"[WARNING] MongoDB connection warning: {e}")
-            print("Note: Using Django ORM with SQLite. MongoDB features may be limited.")
+            print(f'[WARNING] MongoDB connection warning: {e}')
+            print('Note: Using Django ORM with SQLite/Postgres. MongoDB features may be limited.')
