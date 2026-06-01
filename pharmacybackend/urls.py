@@ -6,6 +6,8 @@ from django.urls import path, include
 from django.http import JsonResponse
 from datetime import datetime
 
+from chatbot.views import admin_dashboard_widgets
+
 def health_check(request):
     """Health check endpoint"""
     return JsonResponse({
@@ -27,5 +29,11 @@ urlpatterns = [
     path('', root, name='root'),
     path('health/', health_check, name='health'),
     path('api/', include('api.urls')),
+    # More specific than include('chatbot.urls') — ensures this route resolves even if chatbot.urls is stale.
+    path(
+        'api/chatbot/admin/dashboard/widgets/',
+        admin_dashboard_widgets,
+        name='admin-dashboard-widgets',
+    ),
     path('api/chatbot/', include('chatbot.urls')),
 ]

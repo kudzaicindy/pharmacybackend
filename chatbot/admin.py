@@ -2,9 +2,11 @@ from django.contrib import admin
 from django.db.models import Count, Q
 from .models import (
     ChatConversation, ChatMessage, MedicineRequest, MedicineRequestRankingSnapshot,
+    PharmacyCompositeScoreSnapshot,
     PharmacyResponse,
     Pharmacy, Pharmacist, PharmacyRating, PharmacyInventory, Reservation,
     PharmacistDecline, PatientProfile, PatientNotification, AdminAuditLog,
+    PlatformAdminSettings, ChatbotSafetyReview,
 )
 
 
@@ -22,11 +24,30 @@ class ChatMessageAdmin(admin.ModelAdmin):
     search_fields = ['content']
 
 
+@admin.register(PlatformAdminSettings)
+class PlatformAdminSettingsAdmin(admin.ModelAdmin):
+    list_display = ['singleton_id', 'active_ranking_profile', 'reported_uptime_percent']
+
+
+@admin.register(ChatbotSafetyReview)
+class ChatbotSafetyReviewAdmin(admin.ModelAdmin):
+    list_display = ['review_id', 'status', 'conversation', 'resolved_at', 'created_at']
+    list_filter = ['status', 'created_at']
+
+
 @admin.register(MedicineRequestRankingSnapshot)
 class MedicineRequestRankingSnapshotAdmin(admin.ModelAdmin):
     list_display = ['snapshot_id', 'request', 'source', 'limit_applied', 'created_at']
     list_filter = ['source', 'created_at']
     search_fields = ['snapshot_id', 'request__request_id']
+    readonly_fields = ['snapshot_id', 'created_at']
+
+
+@admin.register(PharmacyCompositeScoreSnapshot)
+class PharmacyCompositeScoreSnapshotAdmin(admin.ModelAdmin):
+    list_display = ['snapshot_id', 'pharmacy', 'ranking_score_0_100', 'leaderboard_rank', 'created_at']
+    list_filter = ['created_at']
+    search_fields = ['snapshot_id', 'pharmacy__pharmacy_id', 'pharmacy__name']
     readonly_fields = ['snapshot_id', 'created_at']
 
 
@@ -199,6 +220,7 @@ class ReservationAdmin(admin.ModelAdmin):
     list_display = [
         'reservation_id',
         'pharmacy',
+        'medicine_request',
         'patient_name',
         'patient_phone',
         'medicine_name',
@@ -208,7 +230,7 @@ class ReservationAdmin(admin.ModelAdmin):
         'expires_at',
     ]
     list_filter = ['status', 'pharmacy']
-    search_fields = ['medicine_name', 'pharmacy__name', 'session_id', 'patient_name', 'patient_phone']
+    search_fields = ['medicine_name', 'pharmacy__name', 'session_id', 'patient_name', 'patient_phone', 'medicine_request__request_id']
 
     def changelist_view(self, request, extra_context=None):
         if extra_context is None:

@@ -8,6 +8,8 @@ from PIL import Image
 import io
 import base64
 
+from .services import normalize_gemini_api_model
+
 # Lazy import to avoid protobuf compatibility issues
 _genai = None
 
@@ -33,8 +35,15 @@ class OCRService:
         
         genai = _get_genai()
         genai.configure(api_key=api_key)
-        # Using gemini-1.5-flash for vision tasks
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        # Deprecated module: upload flow uses chatbot.services.OCRService.
+        model_raw = (
+            os.getenv('GEMINI_VISION_MODEL')
+            or os.getenv('GEMINI_OCR_MODEL')
+            or os.getenv('GEMINI_CHAT_MODEL')
+            or 'gemini-2.0-flash'
+        ).strip()
+        model_name = normalize_gemini_api_model(model_raw)
+        self.model = genai.GenerativeModel(model_name)
     
     def extract_prescription_text(self, image_file) -> Dict:
         """

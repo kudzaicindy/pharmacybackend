@@ -1,5 +1,7 @@
 from django.urls import path
+from rest_framework_simplejwt.views import TokenRefreshView
 from . import views
+from . import mfa_api
 
 urlpatterns = [
     # Patient endpoints
@@ -25,7 +27,18 @@ urlpatterns = [
     path('admin/login/', views.admin_login, name='admin-login'),
     path('admin/logout/', views.admin_logout, name='admin-logout'),
     path('admin/me/', views.admin_me, name='admin-me'),
+    path('admin/csrf/', views.admin_csrf_cookie, name='admin-csrf-cookie'),
     path('admin/dashboard/data/', views.admin_dashboard_data, name='admin-dashboard-data'),
+    path('admin/overview/medi-bot/', views.admin_medi_bot_overview, name='admin-medi-bot-overview'),
+    path('admin/health/', views.admin_health, name='admin-health'),
+    path('admin/ranking/config/', views.admin_ranking_config, name='admin-ranking-config'),
+    path('admin/chatbot/policy/', views.admin_chatbot_policy, name='admin-chatbot-policy'),
+    path('admin/chatbot/reviews/', views.admin_chatbot_reviews, name='admin-chatbot-reviews'),
+    path('admin/chatbot/reviews/<uuid:review_id>/resolve/', views.admin_chatbot_review_resolve, name='admin-chatbot-review-resolve'),
+    path('admin/analytics/geo-heatmap/', views.admin_analytics_geo_heatmap, name='admin-analytics-geo-heatmap'),
+    path('admin/analytics/impact-equity/', views.admin_analytics_impact_equity, name='admin-analytics-impact-equity'),
+    path('admin/metrics/sla/', views.admin_metrics_sla, name='admin-metrics-sla'),
+    path('admin/uptime/report/', views.admin_uptime_report, name='admin-uptime-report'),
     path('admin/control/center/', views.admin_control_center, name='admin-control-center'),
     path('admin/requests/<uuid:request_id>/', views.admin_request_detail, name='admin-request-detail'),
     # Admin access to patient dashboard data (by session_id)
@@ -37,8 +50,12 @@ urlpatterns = [
     path('admin/patients/<str:session_id>/notifications/clear/', views.admin_clear_patient_notifications, name='admin-clear-patient-notifications'),
     path('admin/pharmacies/', views.admin_create_pharmacy, name='admin-create-pharmacy'),
     path('admin/pharmacies/export/', views.admin_export_pharmacies_csv, name='admin-pharmacies-export'),
-    path('admin/pharmacies/<str:pharmacy_id>/', views.admin_update_pharmacy, name='admin-update-pharmacy'),
+    path('admin/pharmacies/verification-queue/', views.admin_pharmacies_verification_queue, name='admin-pharmacies-verification-queue'),
+    path('admin/pharmacies/watchlist/', views.admin_pharmacies_watchlist, name='admin-pharmacies-watchlist'),
+    # More specific paths must be above admin/pharmacies/<pharmacy_id>/ (single-field PATCH/PUT).
+    path('admin/pharmacies/<str:pharmacy_id>/status/', views.admin_patch_pharmacy_status, name='admin-pharmacy-status'),
     path('admin/pharmacies/<str:pharmacy_id>/delete/', views.admin_delete_pharmacy, name='admin-delete-pharmacy'),
+    path('admin/pharmacies/<str:pharmacy_id>/', views.admin_update_pharmacy, name='admin-update-pharmacy'),
     path('admin/pharmacists/', views.admin_create_pharmacist, name='admin-create-pharmacist'),
     path('admin/pharmacists/<uuid:pharmacist_id>/', views.admin_update_pharmacist, name='admin-update-pharmacist'),
     path('admin/pharmacists/<uuid:pharmacist_id>/delete/', views.admin_delete_pharmacist, name='admin-delete-pharmacist'),
@@ -50,25 +67,55 @@ urlpatterns = [
     path('admin/patients-list/', views.admin_patients_list, name='admin-patients-list'),
     path('admin/chatbot/logs/<uuid:conversation_id>/', views.admin_chatbot_conversation_logs, name='admin-chatbot-conversation-logs'),
     path('admin/chatbot/logs/', views.admin_chatbot_logs, name='admin-chatbot-logs'),
+    path('admin/reports/generate/', views.admin_generate_report, name='admin-generate-report'),
 
     # Pharmacist endpoints
     path('pharmacist/login/', views.pharmacist_login, name='pharmacist-login'),
-    path('pharmacist/<uuid:pharmacist_id>/', views.get_pharmacist_profile, name='get-pharmacist-profile'),
+    path('pharmacist/token/refresh/', TokenRefreshView.as_view(), name='pharmacist-token-refresh'),
+    path('pharmacist/password/change/', views.pharmacist_password_change, name='pharmacist-password-change'),
+    path('pharmacist/mfa/status/', mfa_api.pharmacist_mfa_status, name='pharmacist-mfa-status'),
+    path('pharmacist/mfa/setup/start/', mfa_api.pharmacist_mfa_setup_start, name='pharmacist-mfa-setup-start'),
+    path('pharmacist/mfa/setup/confirm/', mfa_api.pharmacist_mfa_setup_confirm, name='pharmacist-mfa-setup-confirm'),
+    path('pharmacist/mfa/disable/', mfa_api.pharmacist_mfa_disable, name='pharmacist-mfa-disable'),
+    path('pharmacist/settings/', views.pharmacist_settings, name='pharmacist-settings'),
+    path('pharmacist/settings/history/', views.pharmacist_settings_history, name='pharmacist-settings-history'),
+    path('pharmacist/settings/reset/', views.pharmacist_settings_reset, name='pharmacist-settings-reset'),
+    path('pharmacist/settings/test-notification/', views.pharmacist_settings_test_notification, name='pharmacist-settings-test-notification'),
+    path('pharmacist/profile/', views.pharmacist_profile_settings, name='pharmacist-profile-settings'),
+    path('pharmacist/security/', views.pharmacist_security_settings, name='pharmacist-security-settings'),
+    # Literal paths before pharmacist/<uuid>/ so misconfigured clients are less likely to hit the profile-only route.
     path('pharmacist/requests/', views.get_pharmacist_requests, name='get-pharmacist-requests'),
+    path(
+        'pharmacist/requests/<uuid:request_id>/prescription-image/',
+        views.pharmacist_request_prescription_image,
+        name='pharmacist-request-prescription-image',
+    ),
     path('pharmacist/response/<uuid:request_id>/', views.submit_pharmacy_response, name='submit-pharmacy-response'),
     path('pharmacist/decline/<uuid:request_id>/', views.decline_pharmacy_request, name='decline-pharmacy-request'),
     path('pharmacist/inventory/', views.pharmacist_inventory, name='pharmacist-inventory'),
     path('pharmacist/reservations/', views.pharmacist_reservations_list, name='pharmacist-reservations-list'),
     path('pharmacist/reservations/<uuid:reservation_id>/confirm/', views.pharmacist_reservation_confirm, name='pharmacist-reservation-confirm'),
     path('pharmacist/reservations/<uuid:reservation_id>/complete/', views.pharmacist_reservation_complete, name='pharmacist-reservation-complete'),
-    
+    path('pharmacist/<uuid:pharmacist_id>/', views.get_pharmacist_profile, name='get-pharmacist-profile'),
+    path('pharmacist/<uuid:pharmacist_id>/ranking-summary/', views.pharmacist_ranking_summary, name='pharmacist-ranking-summary'),
+
     # Legacy pharmacy endpoints (backward compatibility)
     path('pharmacy/requests/', views.get_pharmacist_requests, name='get-pharmacy-requests'),
     path('pharmacy/response/<uuid:request_id>/', views.submit_pharmacy_response, name='submit-pharmacy-response-legacy'),
 
     # Patient dashboard (MediConnect)
+    path('patient/login/', views.patient_login, name='patient-login'),
+    path('patient/mfa/status/', mfa_api.patient_mfa_status, name='patient-mfa-status'),
+    path('patient/mfa/setup/start/', mfa_api.patient_mfa_setup_start, name='patient-mfa-setup-start'),
+    path('patient/mfa/setup/confirm/', mfa_api.patient_mfa_setup_confirm, name='patient-mfa-setup-confirm'),
+    path('patient/mfa/disable/', mfa_api.patient_mfa_disable, name='patient-mfa-disable'),
+    path('auth/login/verify-email-otp/', views.auth_verify_login_email_otp, name='auth-verify-login-email-otp'),
+    path('auth/mfa/login/complete/', views.auth_mfa_login_complete, name='auth-mfa-login-complete'),
+    path('auth/password-reset/request/', views.auth_password_reset_request, name='auth-password-reset-request'),
+    path('auth/password-reset/confirm/', views.auth_password_reset_confirm, name='auth-password-reset-confirm'),
     path('patient/dashboard/stats/', views.patient_dashboard_stats, name='patient-dashboard-stats'),
     path('patient/requests/', views.patient_my_requests, name='patient-my-requests'),
+    path('patient/active-request/', views.patient_active_request, name='patient-active-request'),
     path('patient/requests/<uuid:request_id>/', views.patient_request_detail, name='patient-request-detail'),
     path('patient/saved-medicines/', views.patient_saved_medicines, name='patient-saved-medicines'),
     path('patient/saved-medicines/remove/', views.patient_saved_medicine_remove, name='patient-saved-medicines-remove'),

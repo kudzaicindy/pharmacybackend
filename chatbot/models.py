@@ -72,6 +72,17 @@ class MedicineRequest(models.Model):
     )
     medicine_names = models.JSONField(default=list, help_text="List of medicine names requested")
     symptoms = models.TextField(blank=True, help_text="Symptom description if request_type is 'symptom'")
+    prescription_image = models.FileField(
+        upload_to='prescriptions/%Y/%m/',
+        blank=True,
+        null=True,
+        help_text='Original prescription image for pharmacist verification (patient upload).',
+    )
+    prescription_review_snapshot = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Structured OCR snapshot for pharmacists: items, dosages, confidence, notes.',
+    )
     
     # Location
     location_latitude = models.FloatField(null=True, blank=True)
@@ -92,7 +103,8 @@ class MedicineRequest(models.Model):
             ('responses_received', 'Responses Received'),
             ('ranking', 'Ranking'),
             ('completed', 'Completed'),
-            ('expired', 'Expired')
+            ('expired', 'Expired'),
+            ('superseded', 'Superseded by newer request'),
         ],
         default='created'
     )
@@ -140,6 +152,47 @@ class MedicineRequestRankingSnapshot(models.Model):
         return f"Ranking snapshot {self.snapshot_id} for request {self.request_id}"
 
 
+class PharmacyCompositeScoreSnapshot(models.Model):
+    """
+    Audit trail of pharmacy composite ranking score (P/R/S/T/D) when it changes.
+    Written when GET ranking-summary runs; identical consecutive values are not duplicated.
+    """
+
+    snapshot_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    pharmacy = models.ForeignKey(
+        'Pharmacy',
+        on_delete=models.CASCADE,
+        related_name='composite_score_snapshots',
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    ranking_score_0_100 = models.PositiveSmallIntegerField()
+    price_competitiveness_pct = models.FloatField()
+    response_rate_pct = models.FloatField()
+    stock_reliability_pct = models.FloatField()
+    patient_rating_pct = models.FloatField()
+    distance_pct = models.FloatField(
+        null=True,
+        blank=True,
+        help_text='Proximity vs peers from median response distance_km (90d)',
+    )
+    leaderboard_rank = models.PositiveIntegerField(null=True, blank=True)
+    leaderboard_total = models.PositiveIntegerField(null=True, blank=True)
+    formula = models.CharField(
+        max_length=96,
+        default='(0.25P+0.18R+0.12S+0.15T+0.15D)*100/85',
+        help_text='Composite weights at time of snapshot',
+    )
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['pharmacy', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"Score {self.ranking_score_0_100} @ {self.created_at} ({self.pharmacy_id})"
+
+
 class Pharmacy(models.Model):
     """Pharmacy information"""
     pharmacy_id = models.CharField(max_length=255, unique=True, primary_key=True, validators=[MinLengthValidator(3)])
@@ -149,10 +202,21 @@ class Pharmacy(models.Model):
     longitude = models.FloatField(null=True, blank=True)
     phone = models.CharField(max_length=20, blank=True)
     email = models.EmailField(blank=True)
+    tax_number = models.CharField(max_length=120, blank=True, help_text='Invoice / registry tax id (pharmacy portal)')
+    whatsapp = models.CharField(max_length=40, blank=True, help_text='WhatsApp dial string for patients')
+    website = models.URLField(blank=True, help_text='Pharmacy public website URL')
+    description = models.TextField(blank=True, help_text='Short public / directory description')
     is_active = models.BooleanField(default=True)
     rating = models.FloatField(default=0, blank=True, help_text="Average rating 0-5")
     rating_count = models.IntegerField(default=0, blank=True, help_text="Number of ratings received")
-    response_rate = models.FloatField(default=100, blank=True, help_text="Response rate percentage (0-100)")
+    response_rate = models.FloatField(
+        default=100,
+        blank=True,
+        help_text=(
+            "Fallback response rate %% (0–100) when activity-based rate is not computed. "
+            "APIs use computed rate: patient requests responded to ÷ patient requests in service area."
+        ),
+    )
     pharmacy_type = models.CharField(
         max_length=50,
         blank=True,
@@ -166,8 +230,8 @@ class Pharmacy(models.Model):
             ('pending_review', 'Pending review'),
             ('suspended', 'Suspended'),
         ],
-        default='verified',
-        help_text="Registry verification pill; inactive pharmacies still show as suspended in API.",
+        default='pending_review',
+        help_text="New pharmacies default to pending until an admin sets verified.",
     )
     last_inventory_sync_at = models.DateTimeField(
         null=True,
@@ -192,10 +256,17 @@ class Pharmacist(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, null=True, blank=True, help_text="Link to Django User for authentication")
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
+    display_name = models.CharField(max_length=200, blank=True, help_text='Portal display name (defaults to full name when empty)')
     email = models.EmailField(unique=True)
     phone = models.CharField(max_length=20, blank=True)
     license_number = models.CharField(max_length=100, blank=True, help_text="Pharmacist license/registration number")
     is_active = models.BooleanField(default=True)
+    mfa_totp_secret = models.CharField(
+        max_length=64,
+        blank=True,
+        help_text='Base32 authenticator secret; used when mfa_totp_enabled is true.',
+    )
+    mfa_totp_enabled = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -305,6 +376,14 @@ class Reservation(models.Model):
     """Patient reservation: locks pharmacy stock for 2 hours until pickup or expiry."""
     reservation_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name='reservations')
+    medicine_request = models.ForeignKey(
+        'MedicineRequest',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='reservations',
+        help_text='Broadcast this reservation was created from (patient pickup / dedupe)',
+    )
     # Anonymous: use session_id/conversation; optional user later
     conversation = models.ForeignKey(
         ChatConversation, on_delete=models.CASCADE, related_name='reservations', null=True, blank=True
@@ -333,6 +412,7 @@ class Reservation(models.Model):
         default='pending',
     )
     reserved_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True, help_text="Bumped on confirm/complete/expiry flows for cache freshness")
     expires_at = models.DateTimeField(help_text="Reservation expires 2 hours after creation")
     confirmed_at = models.DateTimeField(null=True, blank=True)
     picked_up_at = models.DateTimeField(null=True, blank=True)
@@ -363,6 +443,61 @@ class PharmacyRating(models.Model):
         return f"{self.pharmacy.name} - {self.rating}/5"
 
 
+class PlatformAdminSettings(models.Model):
+    """
+    Singleton platform config (row with singleton_id='main').
+    Ranking weights: store price/distance/rating/reliability as 0–1 floats (sum ≈ 1) or integers 0–100 (normalized).
+    """
+    singleton_id = models.CharField(max_length=16, primary_key=True, default='main')
+    active_ranking_profile = models.CharField(
+        max_length=64,
+        blank=True,
+        default='',
+        help_text="urban_default | rural_equity | shortage_mode | custom",
+    )
+    ranking_weights_urban = models.JSONField(default=dict, blank=True)
+    ranking_weights_rural = models.JSONField(default=dict, blank=True)
+    chatbot_policy = models.JSONField(default=dict, blank=True)
+    reported_uptime_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True,
+        help_text="Optional manual uptime %% for dashboard when not instrumented.",
+    )
+
+    class Meta:
+        verbose_name = 'Platform admin settings'
+
+    def __str__(self):
+        return f'PlatformAdminSettings({self.singleton_id})'
+
+
+class ChatbotSafetyReview(models.Model):
+    """Human review queue for AI safety / audit tab."""
+    STATUS_CHOICES = [
+        ('critical', 'Critical'),
+        ('warning', 'Warning'),
+        ('safe', 'Safe'),
+    ]
+    review_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation = models.ForeignKey(
+        ChatConversation, on_delete=models.CASCADE, related_name='safety_reviews',
+    )
+    message = models.ForeignKey(
+        ChatMessage, on_delete=models.SET_NULL, null=True, blank=True, related_name='safety_reviews',
+    )
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='warning', db_index=True)
+    patient_query = models.TextField(blank=True)
+    bot_response = models.TextField(blank=True)
+    notes = models.TextField(blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.status} {self.review_id}'
+
+
 class AdminAuditLog(models.Model):
     """Admin action trail for SPA control center (optional compliance / debugging)."""
     user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='admin_audit_logs')
@@ -380,6 +515,129 @@ class AdminAuditLog(models.Model):
 
     def __str__(self):
         return f"{self.created_at:%Y-%m-%d %H:%M} {self.username} {self.action}"
+
+
+class PharmacySettings(models.Model):
+    """Per-pharmacy settings used by pharmacist settings UI."""
+    pharmacy = models.OneToOneField(Pharmacy, on_delete=models.CASCADE, related_name='settings')
+    pharmacist = models.ForeignKey(Pharmacist, on_delete=models.SET_NULL, null=True, blank=True, related_name='settings_updates')
+
+    # Pharmacy profile
+    branch_name = models.CharField(max_length=255, blank=True)
+    city = models.CharField(max_length=120, blank=True)
+    geo_region = models.CharField(max_length=120, blank=True)
+
+    # Operational settings
+    opening_hours = models.JSONField(default=dict, blank=True)
+    timezone = models.CharField(max_length=64, default='Africa/Harare')
+    holiday_mode = models.BooleanField(default=False)
+    accepting_requests = models.BooleanField(
+        default=True,
+        help_text=(
+            'When false: omit from patient live search / nearby notification list and outbound '
+            '"new request" pharmacy emails — pharmacist dashboard inbox still lists broadcasts so '
+            'staff can respond or resume accepting.'
+        ),
+    )
+    pause_outside_opening_hours = models.BooleanField(
+        default=False,
+        help_text='UI hint — auto-pause outside opening_hours when supported by integrations.',
+    )
+    auto_accept_reservations = models.BooleanField(default=False)
+    max_reservation_window_minutes = models.PositiveIntegerField(default=120)
+
+    # Inventory settings
+    low_stock_threshold_default = models.PositiveIntegerField(default=5)
+    out_of_stock_behavior = models.CharField(
+        max_length=32,
+        default='hide',
+        choices=[
+            ('hide', 'Hide item'),
+            ('allow_backorder', 'Allow backorder'),
+            ('notify_only', 'Notify only'),
+        ],
+    )
+    auto_substitute_enabled = models.BooleanField(default=False)
+
+    # Notification settings
+    notify_new_request = models.BooleanField(default=True)
+    notify_low_stock = models.BooleanField(default=True)
+    notify_reservation_expiry = models.BooleanField(default=True)
+    notify_channel_sms = models.BooleanField(default=False)
+    notify_channel_email = models.BooleanField(default=True)
+    notify_channel_in_app = models.BooleanField(default=True)
+    notify_quiet_hours = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='e.g. {"start_local": "22:00", "end_local": "07:30"} — UI/scheduling hints',
+    )
+    notifications_digest_frequency = models.CharField(
+        max_length=24,
+        default='instant',
+        choices=[
+            ('instant', 'Instant'),
+            ('daily', 'Daily digest'),
+            ('weekly', 'Weekly digest'),
+            ('muted', 'Muted'),
+        ],
+    )
+
+    # Service / fulfilment prefs (shown in pharmacist portal settings)
+    preferred_profile = models.CharField(max_length=64, blank=True)
+    service_radius_km = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text='Preferential service radius in km — informational / future ranking use',
+    )
+    service_pickup_available = models.BooleanField(default=True)
+    service_delivery_available = models.BooleanField(default=False)
+    service_areas_covered = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='List of locality names or polygons as JSON primitives',
+    )
+
+    # Compliance/safety
+    disclaimer_visible = models.BooleanField(default=True)
+    prescription_enforcement = models.BooleanField(default=False)
+    audit_logging_enabled = models.BooleanField(default=True)
+
+    # UI preferences
+    ui_dark_mode = models.BooleanField(default=False)
+    ui_table_density = models.CharField(
+        max_length=16,
+        default='comfortable',
+        choices=[('compact', 'Compact'), ('comfortable', 'Comfortable')],
+    )
+    ui_default_page_size = models.PositiveIntegerField(default=25)
+    ui_default_filters = models.JSONField(default=dict, blank=True)
+
+    version = models.PositiveIntegerField(default=1)
+    updated_by = models.CharField(max_length=150, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"Settings {self.pharmacy_id} v{self.version}"
+
+
+class PharmacySettingsHistory(models.Model):
+    """Audit snapshots for pharmacy settings changes."""
+    history_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    settings = models.ForeignKey(PharmacySettings, on_delete=models.CASCADE, related_name='history')
+    changed_by = models.CharField(max_length=150, blank=True)
+    action = models.CharField(max_length=32, default='patch')
+    payload = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.settings_id}:{self.action}@{self.created_at:%Y-%m-%d %H:%M}"
 
 
 # ---- Patient dashboard (MediConnect) ----
@@ -409,6 +667,12 @@ class PatientProfile(models.Model):
     notification_method = models.CharField(max_length=20, default='in_app')
     share_location_with_pharmacies = models.BooleanField(default=True)
     save_search_history = models.BooleanField(default=True)
+    mfa_totp_secret = models.CharField(
+        max_length=64,
+        blank=True,
+        help_text='Base32 authenticator secret; used when mfa_totp_enabled is true.',
+    )
+    mfa_totp_enabled = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -54,6 +54,6 @@ class Command(BaseCommand):
                     inv.reserved_quantity = max(0, inv.reserved_quantity - r.quantity)
                     inv.save(update_fields=['reserved_quantity'])
                 r.status = 'expired'
-                r.save(update_fields=['status'])
+                r.save()
                 updated += 1
         self.stdout.write(self.style.SUCCESS(f'Expired {updated} reservation(s) and released stock.'))

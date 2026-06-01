@@ -3,8 +3,11 @@ Django settings for pharmacybackend project.
 """
 
 import os
+from datetime import timedelta
 from pathlib import Path
-from dotenv import load_dotenv
+
+from django.core.exceptions import ImproperlyConfigured
+from dotenv import load_dotenv, dotenv_values
 import environ
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -15,6 +18,18 @@ _env_file = BASE_DIR / '.env'
 _env_example = BASE_DIR / '.env.example'
 if _env_file.exists():
     load_dotenv(_env_file)
+    # `.env` should win for Mongo switches: a shell may still have USE_SQL_BACKEND / empty MONGODB_URI from an old session.
+    _parsed_env = dotenv_values(_env_file)
+    for _mongo_key in ('MONGODB_URI', 'MONGODB_DB_NAME', 'DJANGO_USE_MONGODB', 'USE_SQL_BACKEND'):
+        if _mongo_key not in _parsed_env:
+            continue
+        _mongo_val = _parsed_env[_mongo_key]
+        if _mongo_val is None:
+            continue
+        _mongo_str = str(_mongo_val).strip()
+        if _mongo_key == 'MONGODB_URI' and not _mongo_str:
+            continue
+        os.environ[_mongo_key] = _mongo_str
 elif _env_example.exists():
     load_dotenv(_env_example)
     if os.getenv('DEBUG', '').lower() == 'true':
@@ -22,10 +37,45 @@ elif _env_example.exists():
 else:
     load_dotenv()  # fallback: current directory
 
-DJANGO_USE_MONGODB = os.getenv('DJANGO_USE_MONGODB', '').lower() in ('1', 'true', 'yes')
+_YES = frozenset({'1', 'true', 'yes', 'on'})
+_NO = frozenset({'0', 'false', 'no', 'off'})
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == '':
+        return default
+    s = str(raw).strip().lower()
+    if s in _YES:
+        return True
+    if s in _NO:
+        return False
+    return default
+
+
+# -----------------------------------------------------------------------------
+# Canonical datastore: MongoDB (django-mongodb-backend). ``default`` carries sessions,
+# contrib (mongo shim apps), chatbot models, etc.
+# Set USE_SQL_BACKEND=true only when you deliberately want SQLite/Postgres-only
+# (e.g. a fork CI job or quick script without Atlas).
+# -----------------------------------------------------------------------------
+USE_SQL_BACKEND = _env_bool('USE_SQL_BACKEND', default=False)
+
 MONGODB_URI = os.getenv('MONGODB_URI', '').strip()
-# Optional SQLite file to read from when importing data (see import_sqlite_to_mongodb command)
+# Optional SQLite file to read from when importing legacy data into MongoDB
 LEGACY_SQLITE_PATH = os.getenv('LEGACY_SQLITE_PATH', '').strip()
+
+explicit_mongo = os.getenv('DJANGO_USE_MONGODB', '').strip().lower()
+
+if USE_SQL_BACKEND:
+    DJANGO_USE_MONGODB = False
+elif explicit_mongo in _NO:
+    DJANGO_USE_MONGODB = False
+elif explicit_mongo in _YES or bool(MONGODB_URI):
+    DJANGO_USE_MONGODB = True
+else:
+    # Default for this deployment: Mongo; connection string required below.
+    DJANGO_USE_MONGODB = True
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
@@ -69,10 +119,9 @@ _APPS_REST = [
 
 if DJANGO_USE_MONGODB:
     if not MONGODB_URI:
-        from django.core.exceptions import ImproperlyConfigured
         raise ImproperlyConfigured(
-            'DJANGO_USE_MONGODB is true but MONGODB_URI is missing. '
-            'Set MONGODB_URI to your Atlas or local connection string.'
+            'MongoDB is required: set MONGODB_URI for the default database. '
+            'For SQLite/Postgres-only dev, set USE_SQL_BACKEND=true.'
         )
     INSTALLED_APPS = [
         'pharmacybackend.mongo_contrib_apps.MongoAdminConfig',
@@ -134,8 +183,7 @@ CHANNEL_LAYERS = {
 }
 
 
-# Database
-# https://docs.djangoproject.com/en/4.2/ref/settings/#databases
+# Database — Mongo canonical default (`default` alias). SQL branches only apply when Mongo is off.
 
 env = environ.Env()
 
@@ -247,11 +295,26 @@ DEFAULT_AUTO_FIELD = (
 
 # REST Framework settings
 REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+    ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.AllowAny',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
+}
+
+# Pharmacist (/ patient later) Bearer tokens issued after login (`access` ~1h, `refresh` configurable).
+JWT_ACCESS_MINUTES = int(os.getenv('JWT_ACCESS_MINUTES', '60') or '60')
+JWT_REFRESH_DAYS = int(os.getenv('JWT_REFRESH_DAYS', '7') or '7')
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=JWT_ACCESS_MINUTES),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=JWT_REFRESH_DAYS),
+    'ROTATE_REFRESH_TOKENS': False,
+    'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
 # CORS settings
@@ -288,3 +351,15 @@ CORS_ALLOW_HEADERS = [
     'x-csrftoken',
     'x-requested-with',
 ]
+
+# Outbound email (SMTP). Leave EMAIL_HOST empty to skip sends (helpers log a warning).
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', '').strip()
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587') or '587')
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'true').lower() in ('1', 'true', 'yes')
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '').strip()
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '').strip()
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', '').strip() or 'noreply@localhost'
+APP_PUBLIC_URL = os.getenv('APP_PUBLIC_URL', '').strip()
+# When true, staff/patient/pharmacist logins email a 6-digit code; client must POST verify with otp_challenge + code.
+LOGIN_EMAIL_2FA = os.getenv('LOGIN_EMAIL_2FA', '').lower() in ('1', 'true', 'yes')
